@@ -1,6 +1,5 @@
 # pi0_policy_mixed_layer_attention.py
 
-import copy
 import math
 import torch
 import torch.nn as nn
@@ -14,7 +13,6 @@ from lerobot.policies.pi0.modeling_pi0 import (
 from lerobot.policies.pi0 import PI0Policy
 from mixed_layer_attention import MixedLayerAttention
 
-# Import internal dependencies from pi_gemma
 from transformers.models.gemma import modeling_gemma
 from lerobot.policies.pi_gemma import _gated_residual
 
@@ -23,6 +21,11 @@ ACTION_EXPERT_LAYERS = 18
 
 
 class LoRALinear(nn.Module):
+    """
+    LoRA adapter for a frozen linear layer.
+    output = frozen(x) + (x @ A @ B)
+    B initialized to zero so adapter contributes nothing at init.
+    """
     def __init__(self, linear: nn.Linear, rank: int = 16):
         super().__init__()
         self.linear = linear
@@ -39,7 +42,48 @@ class LoRALinear(nn.Module):
         return self.linear(x) + (x @ self.A @ self.B)
 
 
-def compute_layer_complete_mla(
+class PI0PytorchMixedLayerAttention(PI0Pytorch):
+    def __init__(self, config, lora_rank: int = 16):
+        super().__init__(config)
+        self.mla = MixedLayerAttention(
+            num_paligemma_layers=PALIGEMMA_LAYERS,
+            num_action_expert_layers=ACTION_EXPERT_LAYERS,
+        )
+        self.lora_rank = lora_rank
+        self._freeze_all()
+        self._build_lora_modules(lora_rank)
+
+    def _freeze_all(self):
+        for param in self.parameters():
+            param.requires_grad_(False)
+        for param in self.mla.parameters():
+            param.requires_grad_(True)
+
+    def _build_lora_modules(self, rank: int):
+        expert_layers = (
+            self.paligemma_with_expert.gemma_expert.model.layers
+        )
+
+        q_in_dim  = expert_layers[0].self_attn.q_proj.in_features
+        q_out_dim = expert_layers[0].self_attn.q_proj.out_features
+        print(f"Expert Q proj: {q_in_dim} → {q_out_dim}")
+
+        # LoRA on action expert Q only
+        for layer in expert_layers:
+            layer.self_attn.q_proj = LoRALinear(layer.self_attn.q_proj, rank=rank)
+
+        frozen    = sum(p.numel() for p in self.parameters() if not p.requires_grad)
+        trainable = sum(p.numel() for p in self.parameters() if p.requires_grad)
+        mla_params = sum(p.numel() for p in self.mla.parameters())
+        q_params   = trainable - mla_params
+
+        print(f"\nFrozen:    {frozen/1e6:.1f}M")
+        print(f"Trainable: {trainable/1e6:.3f}M")
+        print(f"  → MixedLayerAttention: {mla_params} params")
+        print(f"  → Expert Q LoRA:       {q_params/1e6:.3f}M")
+
+    def _compute_layer_mla(
+    self,
     layer_idx,
     inputs_embeds,
     attention_mask,
@@ -47,88 +91,80 @@ def compute_layer_complete_mla(
     adarms_cond,
     paligemma,
     gemma_expert,
-    mla,
     paligemma_hiddens,
 ):
-    """
-    Drop-in replacement for compute_layer_complete that injects
-    mixed-layer attention into the action expert's K and V.
-
-    Differences from the original:
-    - After computing PaliGemma's hidden state for this layer,
-      stores it in paligemma_hiddens (a list passed by reference)
-    - Computes mixed context via mla(paligemma_hiddens, layer_idx)
-    - Uses mixed context for action expert K and V instead of
-      the raw PaliGemma hidden state at this depth
-
-    Everything else — rotary embeddings, attention computation,
-    MLP, residuals — is identical to the original.
-    """
     models = [paligemma.model.language_model, gemma_expert.model]
-    query_states = []
-    key_states = []
-    value_states = []
-    gates = []
+    query_states  = []
+    key_states    = []
+    value_states  = []
+    gates         = []
+    pre_ln_hiddens = []  # save pre-layernorm inputs for residual
+
+    # Store PaliGemma input before this layer runs
+    paligemma_hiddens.append(inputs_embeds[0])
+
+    # Mixed context from all stored hiddens so far
+    mixed_context, _ = self.mla(paligemma_hiddens, expert_layer_idx=layer_idx)
+    # mixed_context: (B, T_prefix, 2048)
 
     for i, hidden_states in enumerate(inputs_embeds):
         layer = models[i].layers[layer_idx]
-        hidden_states, gate = layernorm_forward(layer.input_layernorm, hidden_states, adarms_cond[i])
+
+        # Save pre-layernorm hidden state for residual connection later
+        pre_ln_hiddens.append(hidden_states)
+
+        hidden_states, gate = layernorm_forward(
+            layer.input_layernorm, hidden_states, adarms_cond[i]
+        )
         gates.append(gate)
-        input_shape = hidden_states.shape[:-1]
+        input_shape  = hidden_states.shape[:-1]
         hidden_shape = (*input_shape, -1, layer.self_attn.head_dim)
 
         if i == 0:
-            # PaliGemma stream — standard computation
-            # Store pre-layernorm hidden state for MLA
-            # Note: hidden_states here is post-layernorm; we store
-            # the original input to this layer instead (inputs_embeds[0])
-            query_state = layer.self_attn.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)
-            key_state = layer.self_attn.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)
-            value_state = layer.self_attn.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+            # PaliGemma — Q from own hidden state (frozen)
+            # K and V from mixed context through frozen projections
+            query_state = (
+                layer.self_attn.q_proj(hidden_states)
+                .view(hidden_shape).transpose(1, 2)
+            )
+
+            # Apply layernorm to mixed context before K and V projection
+            mixed_normed, _ = layernorm_forward(
+                layer.input_layernorm,
+                mixed_context.to(dtype=hidden_states.dtype),
+                adarms_cond[i]
+            )
+            mixed_shape = (*mixed_normed.shape[:-1], -1, layer.self_attn.head_dim)
+            key_state = (
+                layer.self_attn.k_proj(mixed_normed)
+                .view(mixed_shape).transpose(1, 2)
+            )
+            value_state = (
+                layer.self_attn.v_proj(mixed_normed)
+                .view(mixed_shape).transpose(1, 2)
+            )
 
         else:
-            # Action expert stream — use mixed context for K and V
-            # Q comes from the action expert's own hidden state (unchanged)
-            query_state = layer.self_attn.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)
-
-            # Compute mixed PaliGemma context up to this layer
-            # paligemma_hiddens[layer_idx] was just stored by the i==0 branch above
-            mixed_context, _ = mla(paligemma_hiddens, expert_layer_idx=layer_idx)
-            # mixed_context: (B, T_prefix + T_suffix, 2048)
-            # Slice to prefix length only — action expert only cross-attends to prefix
-            prefix_len = inputs_embeds[0].shape[1]
-            mixed_prefix = mixed_context[:, :prefix_len, :]
-
-            # Project through action expert's K and V (these have LoRA adapters)
-            mixed_hidden_shape = (*mixed_prefix.shape[:-1], -1, layer.self_attn.head_dim)
-            key_state = layer.self_attn.k_proj(mixed_prefix).view(mixed_hidden_shape).transpose(1, 2)
-            value_state = layer.self_attn.v_proj(mixed_prefix).view(mixed_hidden_shape).transpose(1, 2)
-
-            # Pad key/value to full sequence length to match query length
-            # The original code concatenates all Q/K/V and does joint attention
-            # so we need K and V to cover the full sequence length
-            # Action expert K/V need to cover suffix tokens too (self-attention part)
-            suffix_hidden = hidden_states  # post-layernorm suffix hidden
-            suffix_hidden_shape = (*suffix_hidden.shape[:-1], -1, layer.self_attn.head_dim)
-            key_suffix = layer.self_attn.k_proj(suffix_hidden).view(suffix_hidden_shape).transpose(1, 2)
-            value_suffix = layer.self_attn.v_proj(suffix_hidden).view(suffix_hidden_shape).transpose(1, 2)
-
-            # Concatenate: mixed prefix KV + standard suffix KV
-            key_state = torch.cat([key_state, key_suffix], dim=2)
-            value_state = torch.cat([value_state, value_suffix], dim=2)
+            # Action expert — Q has LoRA, K and V unchanged
+            query_state = (
+                layer.self_attn.q_proj(hidden_states)
+                .view(hidden_shape).transpose(1, 2)
+            )
+            key_state = (
+                layer.self_attn.k_proj(hidden_states)
+                .view(hidden_shape).transpose(1, 2)
+            )
+            value_state = (
+                layer.self_attn.v_proj(hidden_states)
+                .view(hidden_shape).transpose(1, 2)
+            )
 
         query_states.append(query_state)
         key_states.append(key_state)
         value_states.append(value_state)
 
-    # Store PaliGemma's output hidden state for this layer
-    # We store inputs_embeds[0] (pre-layer input) so that layer i
-    # stores what goes INTO layer i, giving us the full hierarchy
-    paligemma_hiddens.append(inputs_embeds[0])
-
-    # Everything below is identical to the original compute_layer_complete
     query_states = torch.cat(query_states, dim=2)
-    key_states = torch.cat(key_states, dim=2)
+    key_states   = torch.cat(key_states,   dim=2)
     value_states = torch.cat(value_states, dim=2)
 
     dummy_tensor = torch.zeros(
@@ -160,7 +196,7 @@ def compute_layer_complete_mla(
 
     outputs_embeds = []
     start_pos = 0
-    for i, hidden_states in enumerate(inputs_embeds):
+    for i, hidden_states in enumerate(pre_ln_hiddens):  # use pre-LN inputs for residual
         layer = models[i].layers[layer_idx]
         end_pos = start_pos + hidden_states.shape[1]
         if att_output.dtype != layer.self_attn.o_proj.weight.dtype:
@@ -168,7 +204,9 @@ def compute_layer_complete_mla(
         out_emb = layer.self_attn.o_proj(att_output[:, start_pos:end_pos])
         out_emb = _gated_residual(hidden_states, out_emb, gates[i])
         after_first_residual = out_emb.clone()
-        out_emb, gate = layernorm_forward(layer.post_attention_layernorm, out_emb, adarms_cond[i])
+        out_emb, gate = layernorm_forward(
+            layer.post_attention_layernorm, out_emb, adarms_cond[i]
+        )
         if layer.mlp.up_proj.weight.dtype == torch.bfloat16:
             out_emb = out_emb.to(dtype=torch.bfloat16)
         out_emb = layer.mlp(out_emb)
@@ -178,59 +216,11 @@ def compute_layer_complete_mla(
 
     return outputs_embeds
 
-
-class PI0PytorchMixedLayerAttention(PI0Pytorch):
-    def __init__(self, config, lora_rank: int = 16):
-        super().__init__(config)
-        self.mla = MixedLayerAttention(
-            num_paligemma_layers=PALIGEMMA_LAYERS,
-            num_action_expert_layers=ACTION_EXPERT_LAYERS,
-        )
-        self._freeze_all()
-        self._apply_lora(lora_rank)
-
-    def _freeze_all(self):
-        for param in self.parameters():
-            param.requires_grad_(False)
-        for param in self.mla.parameters():
-            param.requires_grad_(True)
-
-    def _apply_lora(self, rank: int):
-        expert_layers = self.paligemma_with_expert.gemma_expert.model.layers
-        for layer in expert_layers:
-            layer.self_attn.q_proj = LoRALinear(layer.self_attn.q_proj, rank=rank)
-            layer.self_attn.k_proj = LoRALinear(layer.self_attn.k_proj, rank=rank)
-            layer.self_attn.v_proj = LoRALinear(layer.self_attn.v_proj, rank=rank)
-
-        frozen = sum(p.numel() for p in self.parameters() if not p.requires_grad)
-        trainable = sum(p.numel() for p in self.parameters() if p.requires_grad)
-        mla_params = sum(p.numel() for p in self.mla.parameters())
-        lora_params = trainable - mla_params
-
-        print(f"Frozen:    {frozen/1e6:.1f}M")
-        print(f"Trainable: {trainable/1e6:.2f}M")
-        print(f"  → MixedLayerAttention: {mla_params} params")
-        print(f"  → LoRA Q/K/V:          {lora_params/1e6:.2f}M params")
-
-        k = expert_layers[0].self_attn.k_proj.linear
-        q = expert_layers[0].self_attn.q_proj.linear
-        v = expert_layers[0].self_attn.v_proj.linear
-        print(f"\nProjection dimensions (layer 0):")
-        print(f"  Q: {q.in_features} → {q.out_features}")
-        print(f"  K: {k.in_features} → {k.out_features}")
-        print(f"  V: {v.in_features} → {v.out_features}")
-
     def forward(
         self, images, img_masks, lang_tokens, lang_masks,
         state, actions, noise, time
     ) -> Tensor:
-        """
-        Training forward with mixed-layer attention.
 
-        Replaces the standard joint forward pass with our custom
-        compute_layer_complete_mla which injects mixed PaliGemma
-        context into the action expert's K and V at each layer.
-        """
         time_expanded = time[:, None, None]
         x_t = time_expanded * noise + (1 - time_expanded) * actions
         u_t = noise - actions
@@ -256,19 +246,16 @@ class PI0PytorchMixedLayerAttention(PI0Pytorch):
         position_ids = torch.cumsum(pad_masks, dim=1) - 1
         att_2d_masks_4d = self._prepare_attention_masks_4d(att_2d_masks)
 
-        paligemma = self.paligemma_with_expert.paligemma
+        paligemma   = self.paligemma_with_expert.paligemma
         gemma_expert = self.paligemma_with_expert.gemma_expert
-        models = [paligemma.model.language_model, gemma_expert.model]
-        num_layers = paligemma.config.text_config.num_hidden_layers
+        models      = [paligemma.model.language_model, gemma_expert.model]
+        num_layers  = paligemma.config.text_config.num_hidden_layers
 
-        # This list is populated layer by layer inside compute_layer_complete_mla
-        # Layer i appends inputs_embeds[0] (PaliGemma input to layer i)
-        # so that by the time layer i+1 runs, hiddens[0..i] are available
         paligemma_hiddens = []
+        inputs_embeds     = [prefix_embs, suffix_embs]
 
-        inputs_embeds = [prefix_embs, suffix_embs]
         for layer_idx in range(num_layers):
-            inputs_embeds = compute_layer_complete_mla(
+            inputs_embeds = self._compute_layer_mla(
                 layer_idx=layer_idx,
                 inputs_embeds=inputs_embeds,
                 attention_mask=att_2d_masks_4d,
@@ -276,11 +263,9 @@ class PI0PytorchMixedLayerAttention(PI0Pytorch):
                 adarms_cond=[None, adarms_cond],
                 paligemma=paligemma,
                 gemma_expert=gemma_expert,
-                mla=self.mla,
                 paligemma_hiddens=paligemma_hiddens,
             )
 
-        # Final layer norms
         outputs_embeds = []
         for i, hidden_states in enumerate(inputs_embeds):
             out_emb, _ = layernorm_forward(
