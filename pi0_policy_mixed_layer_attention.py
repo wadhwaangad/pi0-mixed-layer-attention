@@ -68,7 +68,6 @@ class PI0PytorchMixedLayerAttention(PI0Pytorch):
         q_out_dim = expert_layers[0].self_attn.q_proj.out_features
         print(f"Expert Q proj: {q_in_dim} → {q_out_dim}")
 
-        # LoRA on action expert Q only
         for layer in expert_layers:
             layer.self_attn.q_proj = LoRALinear(layer.self_attn.q_proj, rank=rank)
 
@@ -83,138 +82,128 @@ class PI0PytorchMixedLayerAttention(PI0Pytorch):
         print(f"  → Expert Q LoRA:       {q_params/1e6:.3f}M")
 
     def _compute_layer_mla(
-    self,
-    layer_idx,
-    inputs_embeds,
-    attention_mask,
-    position_ids,
-    adarms_cond,
-    paligemma,
-    gemma_expert,
-    paligemma_hiddens,
-):
-    models = [paligemma.model.language_model, gemma_expert.model]
-    query_states  = []
-    key_states    = []
-    value_states  = []
-    gates         = []
-    pre_ln_hiddens = []  # save pre-layernorm inputs for residual
-
-    # Store PaliGemma input before this layer runs
-    paligemma_hiddens.append(inputs_embeds[0])
-
-    # Mixed context from all stored hiddens so far
-    mixed_context, _ = self.mla(paligemma_hiddens, expert_layer_idx=layer_idx)
-    # mixed_context: (B, T_prefix, 2048)
-
-    for i, hidden_states in enumerate(inputs_embeds):
-        layer = models[i].layers[layer_idx]
-
-        # Save pre-layernorm hidden state for residual connection later
-        pre_ln_hiddens.append(hidden_states)
-
-        hidden_states, gate = layernorm_forward(
-            layer.input_layernorm, hidden_states, adarms_cond[i]
-        )
-        gates.append(gate)
-        input_shape  = hidden_states.shape[:-1]
-        hidden_shape = (*input_shape, -1, layer.self_attn.head_dim)
-
-        if i == 0:
-            # PaliGemma — Q from own hidden state (frozen)
-            # K and V from mixed context through frozen projections
-            query_state = (
-                layer.self_attn.q_proj(hidden_states)
-                .view(hidden_shape).transpose(1, 2)
-            )
-
-            # Apply layernorm to mixed context before K and V projection
-            mixed_normed, _ = layernorm_forward(
-                layer.input_layernorm,
-                mixed_context.to(dtype=hidden_states.dtype),
-                adarms_cond[i]
-            )
-            mixed_shape = (*mixed_normed.shape[:-1], -1, layer.self_attn.head_dim)
-            key_state = (
-                layer.self_attn.k_proj(mixed_normed)
-                .view(mixed_shape).transpose(1, 2)
-            )
-            value_state = (
-                layer.self_attn.v_proj(mixed_normed)
-                .view(mixed_shape).transpose(1, 2)
-            )
-
-        else:
-            # Action expert — Q has LoRA, K and V unchanged
-            query_state = (
-                layer.self_attn.q_proj(hidden_states)
-                .view(hidden_shape).transpose(1, 2)
-            )
-            key_state = (
-                layer.self_attn.k_proj(hidden_states)
-                .view(hidden_shape).transpose(1, 2)
-            )
-            value_state = (
-                layer.self_attn.v_proj(hidden_states)
-                .view(hidden_shape).transpose(1, 2)
-            )
-
-        query_states.append(query_state)
-        key_states.append(key_state)
-        value_states.append(value_state)
-
-    query_states = torch.cat(query_states, dim=2)
-    key_states   = torch.cat(key_states,   dim=2)
-    value_states = torch.cat(value_states, dim=2)
-
-    dummy_tensor = torch.zeros(
-        query_states.shape[0],
-        query_states.shape[2],
-        query_states.shape[-1],
-        device=query_states.device,
-        dtype=query_states.dtype,
-    )
-    cos, sin = paligemma.model.language_model.rotary_emb(dummy_tensor, position_ids)
-    query_states, key_states = modeling_gemma.apply_rotary_pos_emb(
-        query_states, key_states, cos, sin, unsqueeze_dim=1
-    )
-
-    batch_size = query_states.shape[0]
-    scaling = paligemma.model.language_model.layers[layer_idx].self_attn.scaling
-
-    att_output, _ = modeling_gemma.eager_attention_forward(
-        paligemma.model.language_model.layers[layer_idx].self_attn,
-        query_states,
-        key_states,
-        value_states,
+        self,
+        layer_idx,
+        inputs_embeds,
         attention_mask,
-        scaling,
-    )
+        position_ids,
+        adarms_cond,
+        paligemma,
+        gemma_expert,
+        paligemma_hiddens,
+    ):
+        models = [paligemma.model.language_model, gemma_expert.model]
+        query_states  = []
+        key_states    = []
+        value_states  = []
+        gates         = []
+        pre_ln_hiddens = []
 
-    head_dim = paligemma.model.language_model.layers[layer_idx].self_attn.head_dim
-    att_output = att_output.reshape(batch_size, -1, 1 * 8 * head_dim)
+        paligemma_hiddens.append(inputs_embeds[0])
 
-    outputs_embeds = []
-    start_pos = 0
-    for i, hidden_states in enumerate(pre_ln_hiddens):  # use pre-LN inputs for residual
-        layer = models[i].layers[layer_idx]
-        end_pos = start_pos + hidden_states.shape[1]
-        if att_output.dtype != layer.self_attn.o_proj.weight.dtype:
-            att_output = att_output.to(layer.self_attn.o_proj.weight.dtype)
-        out_emb = layer.self_attn.o_proj(att_output[:, start_pos:end_pos])
-        out_emb = _gated_residual(hidden_states, out_emb, gates[i])
-        after_first_residual = out_emb.clone()
-        out_emb, gate = layernorm_forward(
-            layer.post_attention_layernorm, out_emb, adarms_cond[i]
+        mixed_context, _ = self.mla(paligemma_hiddens, expert_layer_idx=layer_idx)
+
+        for i, hidden_states in enumerate(inputs_embeds):
+            layer = models[i].layers[layer_idx]
+
+            pre_ln_hiddens.append(hidden_states)
+
+            hidden_states, gate = layernorm_forward(
+                layer.input_layernorm, hidden_states, adarms_cond[i]
+            )
+            gates.append(gate)
+            input_shape  = hidden_states.shape[:-1]
+            hidden_shape = (*input_shape, -1, layer.self_attn.head_dim)
+
+            if i == 0:
+                query_state = (
+                    layer.self_attn.q_proj(hidden_states)
+                    .view(hidden_shape).transpose(1, 2)
+                )
+                mixed_normed, _ = layernorm_forward(
+                    layer.input_layernorm,
+                    mixed_context.to(dtype=hidden_states.dtype),
+                    adarms_cond[i]
+                )
+                mixed_shape = (*mixed_normed.shape[:-1], -1, layer.self_attn.head_dim)
+                key_state = (
+                    layer.self_attn.k_proj(mixed_normed)
+                    .view(mixed_shape).transpose(1, 2)
+                )
+                value_state = (
+                    layer.self_attn.v_proj(mixed_normed)
+                    .view(mixed_shape).transpose(1, 2)
+                )
+            else:
+                query_state = (
+                    layer.self_attn.q_proj(hidden_states)
+                    .view(hidden_shape).transpose(1, 2)
+                )
+                key_state = (
+                    layer.self_attn.k_proj(hidden_states)
+                    .view(hidden_shape).transpose(1, 2)
+                )
+                value_state = (
+                    layer.self_attn.v_proj(hidden_states)
+                    .view(hidden_shape).transpose(1, 2)
+                )
+
+            query_states.append(query_state)
+            key_states.append(key_state)
+            value_states.append(value_state)
+
+        query_states = torch.cat(query_states, dim=2)
+        key_states   = torch.cat(key_states,   dim=2)
+        value_states = torch.cat(value_states, dim=2)
+
+        dummy_tensor = torch.zeros(
+            query_states.shape[0],
+            query_states.shape[2],
+            query_states.shape[-1],
+            device=query_states.device,
+            dtype=query_states.dtype,
         )
-        if layer.mlp.up_proj.weight.dtype == torch.bfloat16:
-            out_emb = out_emb.to(dtype=torch.bfloat16)
-        out_emb = layer.mlp(out_emb)
-        out_emb = _gated_residual(after_first_residual, out_emb, gate)
-        outputs_embeds.append(out_emb)
-        start_pos = end_pos
+        cos, sin = paligemma.model.language_model.rotary_emb(dummy_tensor, position_ids)
+        query_states, key_states = modeling_gemma.apply_rotary_pos_emb(
+            query_states, key_states, cos, sin, unsqueeze_dim=1
+        )
 
-    return outputs_embeds
+        batch_size = query_states.shape[0]
+        scaling = paligemma.model.language_model.layers[layer_idx].self_attn.scaling
+
+        att_output, _ = modeling_gemma.eager_attention_forward(
+            paligemma.model.language_model.layers[layer_idx].self_attn,
+            query_states,
+            key_states,
+            value_states,
+            attention_mask,
+            scaling,
+        )
+
+        head_dim = paligemma.model.language_model.layers[layer_idx].self_attn.head_dim
+        att_output = att_output.reshape(batch_size, -1, 1 * 8 * head_dim)
+
+        outputs_embeds = []
+        start_pos = 0
+        for i, hidden_states in enumerate(pre_ln_hiddens):
+            layer = models[i].layers[layer_idx]
+            end_pos = start_pos + hidden_states.shape[1]
+            if att_output.dtype != layer.self_attn.o_proj.weight.dtype:
+                att_output = att_output.to(layer.self_attn.o_proj.weight.dtype)
+            out_emb = layer.self_attn.o_proj(att_output[:, start_pos:end_pos])
+            out_emb = _gated_residual(hidden_states, out_emb, gates[i])
+            after_first_residual = out_emb.clone()
+            out_emb, gate = layernorm_forward(
+                layer.post_attention_layernorm, out_emb, adarms_cond[i]
+            )
+            if layer.mlp.up_proj.weight.dtype == torch.bfloat16:
+                out_emb = out_emb.to(dtype=torch.bfloat16)
+            out_emb = layer.mlp(out_emb)
+            out_emb = _gated_residual(after_first_residual, out_emb, gate)
+            outputs_embeds.append(out_emb)
+            start_pos = end_pos
+
+        return outputs_embeds
 
     def forward(
         self, images, img_masks, lang_tokens, lang_masks,
