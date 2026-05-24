@@ -63,12 +63,15 @@ for k, v in sample_batch.items():
 
 # ── Training loop ──────────────────────────────────────────────────────────
 
+import os
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+# Build trainable name set once — used for checkpoint saving
+trainable_names = {n for n, p in policy.model.named_parameters() if p.requires_grad}
+
 policy.train()
 step = 0
 data_iter = iter(dataloader)
-
-import os
-os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 while step < NUM_STEPS:
     # Restart dataloader if exhausted
@@ -108,7 +111,7 @@ while step < NUM_STEPS:
         # from the pretrained checkpoint at inference time
         trainable_state = {
             k: v for k, v in policy.model.state_dict().items()
-            if v.requires_grad
+            if k in trainable_names
         }
         torch.save(trainable_state, f"{checkpoint_dir}/model.pt")
         print(f"Saved checkpoint to {checkpoint_dir}")
@@ -120,7 +123,7 @@ final_dir = f"{OUTPUT_DIR}/final"
 os.makedirs(final_dir, exist_ok=True)
 trainable_state = {
     k: v for k, v in policy.model.state_dict().items()
-    if v.requires_grad
+    if k in trainable_names
 }
 torch.save(trainable_state, f"{final_dir}/model.pt")
 print("Training complete.")
