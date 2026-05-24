@@ -99,6 +99,7 @@ class PI0PytorchMixedLayerAttention(PI0Pytorch):
         gates         = []
         pre_ln_hiddens = []
 
+        use_mixed = len(paligemma_hiddens) > 0
         mixed_context, _ = self.mla(paligemma_hiddens, expert_layer_idx=layer_idx)
 
         for i, hidden_states in enumerate(inputs_embeds):
@@ -118,37 +119,30 @@ class PI0PytorchMixedLayerAttention(PI0Pytorch):
                     layer.self_attn.q_proj(hidden_states)
                     .view(hidden_shape).transpose(1, 2)
                 )
-                mixed_normed, _ = layernorm_forward(
-                    layer.input_layernorm,
-                    mixed_context.to(dtype=hidden_states.dtype),
-                    adarms_cond[i]
-                )
-                mixed_shape = (*mixed_normed.shape[:-1], -1, layer.self_attn.head_dim)
-                key_state = (
-                    layer.self_attn.k_proj(mixed_normed)
-                    .view(mixed_shape).transpose(1, 2)
-                )
-                value_state = (
-                    layer.self_attn.v_proj(mixed_normed)
-                    .view(mixed_shape).transpose(1, 2)
-                )
-            else:
-                query_state = (
-                    layer.self_attn.q_proj(hidden_states)
-                    .view(hidden_shape).transpose(1, 2)
-                )
-                key_state = (
-                    layer.self_attn.k_proj(hidden_states)
-                    .view(hidden_shape).transpose(1, 2)
-                )
-                value_state = (
-                    layer.self_attn.v_proj(hidden_states)
-                    .view(hidden_shape).transpose(1, 2)
-                )
-
-            query_states.append(query_state)
-            key_states.append(key_state)
-            value_states.append(value_state)
+                if use_mixed:
+                    mixed_normed, _ = layernorm_forward(
+                        layer.input_layernorm,
+                        mixed_context.to(dtype=hidden_states.dtype),
+                        adarms_cond[i]
+                    )
+                    mixed_shape = (*mixed_normed.shape[:-1], -1, layer.self_attn.head_dim)
+                    key_state = (
+                        layer.self_attn.k_proj(mixed_normed)
+                        .view(mixed_shape).transpose(1, 2)
+                    )
+                    value_state = (
+                        layer.self_attn.v_proj(mixed_normed)
+                        .view(mixed_shape).transpose(1, 2)
+                    )
+                else:
+                    key_state = (
+                        layer.self_attn.k_proj(hidden_states)
+                        .view(hidden_shape).transpose(1, 2)
+                    )
+                    value_state = (
+                        layer.self_attn.v_proj(hidden_states)
+                        .view(hidden_shape).transpose(1, 2)
+                    )
 
         query_states = torch.cat(query_states, dim=2)
         key_states   = torch.cat(key_states,   dim=2)
@@ -200,7 +194,7 @@ class PI0PytorchMixedLayerAttention(PI0Pytorch):
             out_emb = _gated_residual(after_first_residual, out_emb, gate)
             outputs_embeds.append(out_emb)
             start_pos = end_pos
-        paligemma_hiddens.append(inputs_embeds[0])
+        paligemma_hiddens.append(outputs_embeds[0])
         return outputs_embeds
 
     def forward(
