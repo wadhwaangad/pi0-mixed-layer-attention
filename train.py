@@ -1,11 +1,14 @@
 # train.py
 
 import os
+import gc
+import json
 import time
 import torch
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import LinearLR
 from lerobot.policies.pi0 import PI0Config
+from lerobot.configs.types import FeatureType, PolicyFeature
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from torch.utils.data import DataLoader
 from safetensors.torch import load_file
@@ -30,28 +33,26 @@ MODEL_ID = "lerobot/pi0_libero_base"
 
 print(f"[setup] Loading config from {MODEL_ID} ...")
 t0 = time.time()
-config = PI0Config(
-    device="cpu",
-    input_features={
-        "observation.images.image":  {"type": "VISUAL", "shape": [3, 256, 256]},
-        "observation.images.image2": {"type": "VISUAL", "shape": [3, 256, 256]},
-        "observation.state":         {"type": "STATE",  "shape": [8]},
-    },
-    output_features={
-        "action": {"type": "ACTION", "shape": [7]},
-    },
-    empty_cameras=1,
-    paligemma_variant="gemma_2b",
-    action_expert_variant="gemma_300m",
-    dtype="bfloat16",
-    chunk_size=50,
-    n_action_steps=10,
-    max_action_dim=32,
-    max_state_dim=32,
-    num_inference_steps=10,
-    image_resolution=[224, 224],
-    tokenizer_max_length=48,
-)  # keep on CPU during init — move to GPU once at the end
+
+config_path = hf_hub_download(MODEL_ID, "config.json")
+with open(config_path) as f:
+    config_dict = json.load(f)
+
+config_dict.pop("type", None)  # remove field that breaks PI0Config
+config_dict["device"] = "cpu"  # keep on CPU during init
+config_dict["dtype"] = "bfloat16"  # halve VRAM — handled correctly by PaliGemmaWithExpertModel
+
+# Convert raw feature dicts to PolicyFeature objects
+for key, val in config_dict.get("input_features", {}).items():
+    config_dict["input_features"][key] = PolicyFeature(
+        type=FeatureType[val["type"]], shape=tuple(val["shape"])
+    )
+for key, val in config_dict.get("output_features", {}).items():
+    config_dict["output_features"][key] = PolicyFeature(
+        type=FeatureType[val["type"]], shape=tuple(val["shape"])
+    )
+
+config = PI0Config(**config_dict)
 print(f"[setup] Config loaded in {time.time()-t0:.1f}s")
 
 print("[setup] Building PI0PolicyMixedLayerAttention on CPU ...")
@@ -61,7 +62,7 @@ print("[setup] Loading pretrained weights from cache ...")
 weights_path = hf_hub_download(MODEL_ID, "model.safetensors")
 state_dict = load_file(weights_path, device="cpu")
 
-# Add "model." prefix to match policy.model.state_dict() keys
+# Add "model." prefix to match policy state_dict keys
 remapped = {}
 for k, v in state_dict.items():
     new_key = k if k.startswith("model.") else f"model.{k}"
@@ -74,8 +75,8 @@ if missing:
 if unexpected:
     print(f"  Unexpected: {unexpected[:5]}")
 
-del state_dict, remapped  # free CPU memory
-import gc; gc.collect()
+del state_dict, remapped
+gc.collect()
 
 print(f"[setup] Moving model to {DEVICE} ...")
 policy = policy.to(DEVICE)
@@ -86,10 +87,11 @@ trainable_params = [p for p in policy.parameters() if p.requires_grad]
 total_trainable = sum(p.numel() for p in trainable_params)
 total_frozen    = sum(p.numel() for p in policy.parameters() if not p.requires_grad)
 print(f"[setup] Trainable: {total_trainable/1e6:.3f}M | Frozen: {total_frozen/1e6:.1f}M")
+mem_gb = torch.cuda.memory_allocated() / 1e9
+print(f"[setup] GPU mem after model load: {mem_gb:.1f}GB")
 
 optimizer = AdamW(trainable_params, lr=LR, weight_decay=WEIGHT_DECAY)
 
-# Linear warmup from 0 to LR over WARMUP_STEPS
 scheduler = LinearLR(
     optimizer,
     start_factor=1e-8,
@@ -111,7 +113,7 @@ dataloader = DataLoader(
     pin_memory=True,
 )
 
-# ── Verify batch keys before committing to training ────────────────────────
+# ── Verify batch keys ──────────────────────────────────────────────────────
 
 print("[setup] Verifying batch ...")
 sample_batch = next(iter(dataloader))
@@ -125,7 +127,6 @@ for k, v in sample_batch.items():
 
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-# Build trainable name set once — used for checkpoint saving
 trainable_names = {n for n, p in policy.model.named_parameters() if p.requires_grad}
 print(f"[setup] Trainable param names: {len(trainable_names)}")
 
@@ -137,7 +138,6 @@ step_times = []
 print("[train] Starting training loop ...")
 
 while step < NUM_STEPS:
-    # Restart dataloader if exhausted
     try:
         batch = next(data_iter)
     except StopIteration:
@@ -145,7 +145,6 @@ while step < NUM_STEPS:
         batch = next(data_iter)
         print(f"[train] Restarted dataloader at step {step}")
 
-    # Move batch to GPU
     batch = {
         k: v.to(DEVICE) if isinstance(v, torch.Tensor) else v
         for k, v in batch.items()
@@ -153,19 +152,13 @@ while step < NUM_STEPS:
 
     t_step = time.time()
 
-    # Forward pass — PI0Policy.forward returns (loss, loss_dict)
     loss, loss_dict = policy.forward(batch)
 
-    # Backward pass
     optimizer.zero_grad()
     loss.backward()
-
-    # Gradient norm for debugging
     grad_norm = torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=GRAD_CLIP)
-
     optimizer.step()
 
-    # Step scheduler only during warmup
     if step < WARMUP_STEPS:
         scheduler.step()
 
