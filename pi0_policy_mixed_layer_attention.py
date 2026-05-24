@@ -143,6 +143,23 @@ class PI0PytorchMixedLayerAttention(PI0Pytorch):
                         layer.self_attn.v_proj(hidden_states)
                         .view(hidden_shape).transpose(1, 2)
                     )
+            else:
+                query_state = (
+                    layer.self_attn.q_proj(hidden_states)
+                    .view(hidden_shape).transpose(1, 2)
+                )
+                key_state = (
+                    layer.self_attn.k_proj(hidden_states)
+                    .view(hidden_shape).transpose(1, 2)
+                )
+                value_state = (
+                    layer.self_attn.v_proj(hidden_states)
+                    .view(hidden_shape).transpose(1, 2)
+                )
+
+            query_states.append(query_state)
+            key_states.append(key_state)
+            value_states.append(value_state)
 
         query_states = torch.cat(query_states, dim=2)
         key_states   = torch.cat(key_states,   dim=2)
@@ -194,7 +211,8 @@ class PI0PytorchMixedLayerAttention(PI0Pytorch):
             out_emb = _gated_residual(after_first_residual, out_emb, gate)
             outputs_embeds.append(out_emb)
             start_pos = end_pos
-        paligemma_hiddens.append(outputs_embeds[0])
+
+        paligemma_hiddens.append(outputs_embeds[0])  # post-layer paligemma hidden
         return outputs_embeds
 
     def forward(
