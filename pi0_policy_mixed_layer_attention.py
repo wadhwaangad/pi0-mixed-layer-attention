@@ -39,7 +39,7 @@ class LoRALinear(nn.Module):
         nn.init.kaiming_uniform_(self.A, a=math.sqrt(5))
 
     def forward(self, x):
-        return self.linear(x) + (x @ self.A @ self.B)
+        return self.linear(x) + (x @ self.A.to(x.dtype) @ self.B.to(x.dtype))
 
 
 class PI0PytorchMixedLayerAttention(PI0Pytorch):
