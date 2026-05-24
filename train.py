@@ -23,7 +23,7 @@ OUTPUT_DIR = "./outputs/mixed_layer_attention"
 
 # ── Setup ──────────────────────────────────────────────────────────────────
 
-config = PI0Config.from_pretrained("lerobot/pi0_libero_base")
+config = PI0Config("lerobot/pi0_libero_base")
 policy = PI0PolicyMixedLayerAttention(config)
 policy = policy.to(DEVICE)
 
