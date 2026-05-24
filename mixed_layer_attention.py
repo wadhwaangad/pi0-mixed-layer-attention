@@ -31,16 +31,16 @@ class MixedLayerAttention(nn.Module):
         self.gamma = nn.Parameter(torch.ones(L))
 
     def forward(self, paligemma_hiddens: list[Tensor], expert_layer_idx: int):
-    i = expert_layer_idx
-    if len(paligemma_hiddens) == 0:
-        # Nothing to mix yet — return zeros matching expected shape
-        # Will be gated by gamma[0] ≈ 1.0 initially, so just return zeros
-        dummy = torch.zeros(1, device=self.gamma.device)  # MLA contributes nothing
-        return dummy, dummy
-    weights = F.softmax(self.layer_logits[i], dim=0)
-    stacked = torch.stack(paligemma_hiddens[:i + 1], dim=0)
-    mixed = (stacked * weights.view(i + 1, 1, 1, 1)).sum(dim=0)
-    return self.gamma[i] * mixed, weights.detach()
+        i = expert_layer_idx
+        if len(paligemma_hiddens) == 0:
+            # Nothing to mix yet — return zeros matching expected shape
+            # Will be gated by gamma[0] ≈ 1.0 initially, so just return zeros
+            dummy = torch.zeros(1, device=self.gamma.device)  # MLA contributes nothing
+            return dummy, dummy
+        weights = F.softmax(self.layer_logits[i], dim=0)
+        stacked = torch.stack(paligemma_hiddens[:i + 1], dim=0)
+        mixed = (stacked * weights.view(i + 1, 1, 1, 1)).sum(dim=0)
+        return self.gamma[i] * mixed, weights.detach()
 
     def get_layer_weights(self) -> list[Tensor]:
         return [F.softmax(logits, dim=0).detach().cpu() 
