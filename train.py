@@ -122,7 +122,7 @@ def tokenize_batch(batch, device):
         truncation=True,
     ).to(device)
     batch["observation.language.tokens"] = tokens["input_ids"]
-    batch["observation.language.attention_mask"] = tokens["attention_mask"]
+    batch["observation.language.attention_mask"] = tokens["attention_mask"].bool()
     return batch
 
 # ── Dataset ────────────────────────────────────────────────────────────────
