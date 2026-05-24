@@ -99,7 +99,8 @@ class PI0PytorchMixedLayerAttention(PI0Pytorch):
         gates         = []
         pre_ln_hiddens = []
 
-        use_mixed = len(paligemma_hiddens) > 0
+        paligemma_hiddens.append(inputs_embeds[0])
+        use_mixed = True  # always at least one hidden now
         mixed_context, _ = self.mla(paligemma_hiddens, expert_layer_idx=layer_idx)
 
         for i, hidden_states in enumerate(inputs_embeds):
@@ -212,7 +213,6 @@ class PI0PytorchMixedLayerAttention(PI0Pytorch):
             outputs_embeds.append(out_emb)
             start_pos = end_pos
 
-        paligemma_hiddens.append(outputs_embeds[0])  # post-layer paligemma hidden
         return outputs_embeds
 
     def forward(
