@@ -37,8 +37,8 @@ class MixedLayerAttention(nn.Module):
             # Will be gated by gamma[0] ≈ 1.0 initially, so just return zeros
             dummy = torch.zeros(1, device=self.gamma.device)  # MLA contributes nothing
             return dummy, dummy
-        weights = F.softmax(self.layer_logits[i], dim=0)
-        stacked = torch.stack(paligemma_hiddens[:i + 1], dim=0)
+        weights = F.softmax(self.layer_logits[i], dim=0)       # shape: (i+1,)
+        stacked = torch.stack(paligemma_hiddens[:i + 1], dim=0) # shape: (i+1, B, T, D)
         mixed = (stacked * weights.view(i + 1, 1, 1, 1)).sum(dim=0)
         return self.gamma[i] * mixed, weights.detach()
 
