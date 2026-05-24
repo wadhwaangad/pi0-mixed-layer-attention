@@ -10,10 +10,10 @@ from torch.optim.lr_scheduler import LinearLR
 from lerobot.policies.pi0 import PI0Config
 from lerobot.configs.types import FeatureType, PolicyFeature
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
-from lerobot.policies.factory import make_pre_post_processors
 from torch.utils.data import DataLoader
 from safetensors.torch import load_file
 from huggingface_hub import hf_hub_download
+from transformers import AutoTokenizer
 from pi0_policy_mixed_layer_attention import PI0PolicyMixedLayerAttention
 
 # ── Config ─────────────────────────────────────────────────────────────────
@@ -30,7 +30,7 @@ WARMUP_STEPS = 500
 OUTPUT_DIR = "./outputs/mixed_layer_attention"
 MODEL_ID = "lerobot/pi0_libero_base"
 
-# ── Setup ──────────────────────────────────────────────────────────────────
+# ── Config ─────────────────────────────────────────────────────────────────
 
 print(f"[setup] Loading config from {MODEL_ID} ...")
 t0 = time.time()
@@ -39,11 +39,10 @@ config_path = hf_hub_download(MODEL_ID, "config.json")
 with open(config_path) as f:
     config_dict = json.load(f)
 
-config_dict.pop("type", None)  # remove field that breaks PI0Config
-config_dict["device"] = DEVICE
-config_dict["dtype"] = "bfloat16"  # handled correctly by PaliGemmaWithExpertModel
+config_dict.pop("type", None)
+config_dict["device"] = "cpu"   # keep on CPU during init
+config_dict["dtype"] = "bfloat16"
 
-# Convert raw feature dicts to PolicyFeature objects
 for key, val in config_dict.get("input_features", {}).items():
     config_dict["input_features"][key] = PolicyFeature(
         type=FeatureType[val["type"]], shape=tuple(val["shape"])
@@ -56,16 +55,15 @@ for key, val in config_dict.get("output_features", {}).items():
 config = PI0Config(**config_dict)
 print(f"[setup] Config loaded in {time.time()-t0:.1f}s")
 
+# ── Model ──────────────────────────────────────────────────────────────────
+
 print("[setup] Building PI0PolicyMixedLayerAttention on CPU ...")
-config.device = "cpu"  # keep on CPU during init
 policy = PI0PolicyMixedLayerAttention(config)
-config.device = DEVICE  # restore for preprocessor
 
 print("[setup] Loading pretrained weights from cache ...")
 weights_path = hf_hub_download(MODEL_ID, "model.safetensors")
 state_dict = load_file(weights_path, device="cpu")
 
-# Add "model." prefix to match policy state_dict keys
 remapped = {}
 for k, v in state_dict.items():
     new_key = k if k.startswith("model.") else f"model.{k}"
@@ -82,20 +80,19 @@ del state_dict, remapped
 gc.collect()
 
 print(f"[setup] Moving model to {DEVICE} ...")
+config.device = DEVICE  # restore before moving
 policy = policy.to(DEVICE)
 print(f"[setup] Model on {DEVICE}")
+print(f"[setup] GPU mem after model load: {torch.cuda.memory_allocated()/1e9:.1f}GB")
 
-mem_gb = torch.cuda.memory_allocated() / 1e9
-print(f"[setup] GPU mem after model load: {mem_gb:.1f}GB")
+# ── Optimizer ──────────────────────────────────────────────────────────────
 
-# Only pass trainable parameters to optimizer
 trainable_params = [p for p in policy.parameters() if p.requires_grad]
 total_trainable = sum(p.numel() for p in trainable_params)
 total_frozen    = sum(p.numel() for p in policy.parameters() if not p.requires_grad)
 print(f"[setup] Trainable: {total_trainable/1e6:.3f}M | Frozen: {total_frozen/1e6:.1f}M")
 
 optimizer = AdamW(trainable_params, lr=LR, weight_decay=WEIGHT_DECAY)
-
 scheduler = LinearLR(
     optimizer,
     start_factor=1e-8,
@@ -103,11 +100,30 @@ scheduler = LinearLR(
     total_iters=WARMUP_STEPS,
 )
 
-# ── Preprocessor ───────────────────────────────────────────────────────────
+# ── Tokenizer ──────────────────────────────────────────────────────────────
 
-print("[setup] Building preprocessor ...")
-preprocessor, _ = make_pre_post_processors(config, dataset_stats=None)
-print("[setup] Preprocessor ready")
+print("[setup] Loading tokenizer ...")
+tokenizer = AutoTokenizer.from_pretrained("google/paligemma-3b-pt-224")
+print("[setup] Tokenizer ready")
+
+def tokenize_batch(batch, device):
+    """Tokenize task strings and add to batch. Moves tensors to device."""
+    batch = {
+        k: v.to(device) if isinstance(v, torch.Tensor) else v
+        for k, v in batch.items()
+    }
+    # Pi0 expects a newline appended to each task string
+    tasks = [t + "\n" for t in batch["task"]]
+    tokens = tokenizer(
+        tasks,
+        return_tensors="pt",
+        padding="max_length",
+        max_length=config.tokenizer_max_length,
+        truncation=True,
+    ).to(device)
+    batch["observation.language.tokens"] = tokens["input_ids"]
+    batch["observation.language.attention_mask"] = tokens["attention_mask"]
+    return batch
 
 # ── Dataset ────────────────────────────────────────────────────────────────
 
@@ -120,14 +136,13 @@ dataloader = DataLoader(
     batch_size=BATCH_SIZE,
     shuffle=True,
     num_workers=4,
-    pin_memory=False,  # pin_memory=False since preprocessor moves to device
+    pin_memory=True,
 )
 
 # ── Verify batch ───────────────────────────────────────────────────────────
 
 print("[setup] Verifying batch ...")
-sample_batch = next(iter(dataloader))
-sample_batch = preprocessor(sample_batch)
+sample_batch = tokenize_batch(next(iter(dataloader)), DEVICE)
 print("Batch keys:", list(sample_batch.keys()))
 print("Batch shapes:")
 for k, v in sample_batch.items():
@@ -137,7 +152,6 @@ for k, v in sample_batch.items():
 # ── Training loop ──────────────────────────────────────────────────────────
 
 os.makedirs(OUTPUT_DIR, exist_ok=True)
-
 trainable_names = {n for n, p in policy.model.named_parameters() if p.requires_grad}
 print(f"[setup] Trainable param names: {len(trainable_names)}")
 
@@ -156,8 +170,7 @@ while step < NUM_STEPS:
         batch = next(data_iter)
         print(f"[train] Restarted dataloader at step {step}")
 
-    # Tokenize, normalize, and move to device
-    batch = preprocessor(batch)
+    batch = tokenize_batch(batch, DEVICE)
 
     t_step = time.time()
 
@@ -177,14 +190,14 @@ while step < NUM_STEPS:
         lr = optimizer.param_groups[0]["lr"]
         avg_step_ms = (sum(step_times[-LOG_EVERY:]) / max(len(step_times[-LOG_EVERY:]), 1)) * 1000
         mem_gb = torch.cuda.memory_allocated() / 1e9
-        mem_reserved_gb = torch.cuda.memory_reserved() / 1e9
+        mem_res_gb = torch.cuda.memory_reserved() / 1e9
         print(
             f"[train] Step {step:06d}/{NUM_STEPS} | "
             f"Loss: {loss.item():.4f} | "
             f"LR: {lr:.2e} | "
             f"GradNorm: {grad_norm:.3f} | "
             f"StepTime: {avg_step_ms:.0f}ms | "
-            f"GPU mem: {mem_gb:.1f}GB alloc / {mem_reserved_gb:.1f}GB reserved"
+            f"GPU mem: {mem_gb:.1f}GB alloc / {mem_res_gb:.1f}GB reserved"
         )
 
     if step % SAVE_EVERY == 0 and step > 0:
@@ -199,7 +212,8 @@ while step < NUM_STEPS:
 
     step += 1
 
-# Save final checkpoint
+# ── Final checkpoint ───────────────────────────────────────────────────────
+
 final_dir = f"{OUTPUT_DIR}/final"
 os.makedirs(final_dir, exist_ok=True)
 trainable_state = {
