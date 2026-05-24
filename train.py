@@ -128,7 +128,12 @@ def tokenize_batch(batch, device):
 # ── Dataset ────────────────────────────────────────────────────────────────
 
 print("[setup] Loading dataset ...")
-dataset = LeRobotDataset("lerobot/libero")
+dataset = LeRobotDataset(
+    "lerobot/libero",
+    delta_timestamps={
+        "action": [i / 10 for i in range(50)],  
+    },
+)
 print(f"[setup] Dataset size: {len(dataset)} samples")
 
 dataloader = DataLoader(
