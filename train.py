@@ -10,6 +10,7 @@ from torch.optim.lr_scheduler import LinearLR
 from lerobot.policies.pi0 import PI0Config
 from lerobot.configs.types import FeatureType, PolicyFeature
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
+from lerobot.policies.factory import make_pre_post_processors
 from torch.utils.data import DataLoader
 from safetensors.torch import load_file
 from huggingface_hub import hf_hub_download
@@ -39,8 +40,8 @@ with open(config_path) as f:
     config_dict = json.load(f)
 
 config_dict.pop("type", None)  # remove field that breaks PI0Config
-config_dict["device"] = "cpu"  # keep on CPU during init
-config_dict["dtype"] = "bfloat16"  # halve VRAM — handled correctly by PaliGemmaWithExpertModel
+config_dict["device"] = DEVICE
+config_dict["dtype"] = "bfloat16"  # handled correctly by PaliGemmaWithExpertModel
 
 # Convert raw feature dicts to PolicyFeature objects
 for key, val in config_dict.get("input_features", {}).items():
@@ -56,7 +57,9 @@ config = PI0Config(**config_dict)
 print(f"[setup] Config loaded in {time.time()-t0:.1f}s")
 
 print("[setup] Building PI0PolicyMixedLayerAttention on CPU ...")
+config.device = "cpu"  # keep on CPU during init
 policy = PI0PolicyMixedLayerAttention(config)
+config.device = DEVICE  # restore for preprocessor
 
 print("[setup] Loading pretrained weights from cache ...")
 weights_path = hf_hub_download(MODEL_ID, "model.safetensors")
@@ -82,13 +85,14 @@ print(f"[setup] Moving model to {DEVICE} ...")
 policy = policy.to(DEVICE)
 print(f"[setup] Model on {DEVICE}")
 
+mem_gb = torch.cuda.memory_allocated() / 1e9
+print(f"[setup] GPU mem after model load: {mem_gb:.1f}GB")
+
 # Only pass trainable parameters to optimizer
 trainable_params = [p for p in policy.parameters() if p.requires_grad]
 total_trainable = sum(p.numel() for p in trainable_params)
 total_frozen    = sum(p.numel() for p in policy.parameters() if not p.requires_grad)
 print(f"[setup] Trainable: {total_trainable/1e6:.3f}M | Frozen: {total_frozen/1e6:.1f}M")
-mem_gb = torch.cuda.memory_allocated() / 1e9
-print(f"[setup] GPU mem after model load: {mem_gb:.1f}GB")
 
 optimizer = AdamW(trainable_params, lr=LR, weight_decay=WEIGHT_DECAY)
 
@@ -98,6 +102,12 @@ scheduler = LinearLR(
     end_factor=1.0,
     total_iters=WARMUP_STEPS,
 )
+
+# ── Preprocessor ───────────────────────────────────────────────────────────
+
+print("[setup] Building preprocessor ...")
+preprocessor, _ = make_pre_post_processors(config, dataset_stats=None)
+print("[setup] Preprocessor ready")
 
 # ── Dataset ────────────────────────────────────────────────────────────────
 
@@ -110,18 +120,19 @@ dataloader = DataLoader(
     batch_size=BATCH_SIZE,
     shuffle=True,
     num_workers=4,
-    pin_memory=True,
+    pin_memory=False,  # pin_memory=False since preprocessor moves to device
 )
 
-# ── Verify batch keys ──────────────────────────────────────────────────────
+# ── Verify batch ───────────────────────────────────────────────────────────
 
 print("[setup] Verifying batch ...")
 sample_batch = next(iter(dataloader))
+sample_batch = preprocessor(sample_batch)
 print("Batch keys:", list(sample_batch.keys()))
 print("Batch shapes:")
 for k, v in sample_batch.items():
     if isinstance(v, torch.Tensor):
-        print(f"  {k}: {v.shape}")
+        print(f"  {k}: {v.shape} | dtype: {v.dtype}")
 
 # ── Training loop ──────────────────────────────────────────────────────────
 
@@ -145,10 +156,8 @@ while step < NUM_STEPS:
         batch = next(data_iter)
         print(f"[train] Restarted dataloader at step {step}")
 
-    batch = {
-        k: v.to(DEVICE) if isinstance(v, torch.Tensor) else v
-        for k, v in batch.items()
-    }
+    # Tokenize, normalize, and move to device
+    batch = preprocessor(batch)
 
     t_step = time.time()
 
