@@ -30,8 +30,28 @@ MODEL_ID = "lerobot/pi0_libero_base"
 
 print(f"[setup] Loading config from {MODEL_ID} ...")
 t0 = time.time()
-config = PI0Config.from_pretrained(MODEL_ID)
-config.device = "cpu"  # keep on CPU during init — move to GPU once at the end
+config = PI0Config(
+    device="cpu",
+    input_features={
+        "observation.images.image":  {"type": "VISUAL", "shape": [3, 256, 256]},
+        "observation.images.image2": {"type": "VISUAL", "shape": [3, 256, 256]},
+        "observation.state":         {"type": "STATE",  "shape": [8]},
+    },
+    output_features={
+        "action": {"type": "ACTION", "shape": [7]},
+    },
+    empty_cameras=1,
+    paligemma_variant="gemma_2b",
+    action_expert_variant="gemma_300m",
+    dtype="float32",
+    chunk_size=50,
+    n_action_steps=10,
+    max_action_dim=32,
+    max_state_dim=32,
+    num_inference_steps=10,
+    image_resolution=[224, 224],
+    tokenizer_max_length=48,
+)  # keep on CPU during init — move to GPU once at the end
 print(f"[setup] Config loaded in {time.time()-t0:.1f}s")
 
 print("[setup] Building PI0PolicyMixedLayerAttention on CPU ...")
