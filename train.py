@@ -5,15 +5,17 @@ import time
 import torch
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import LinearLR
-from lerobot.policies.pi0 import PI0Policy, PI0Config
+from lerobot.policies.pi0 import PI0Config
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from torch.utils.data import DataLoader
+from safetensors.torch import load_file
+from huggingface_hub import hf_hub_download
 from pi0_policy_mixed_layer_attention import PI0PolicyMixedLayerAttention
 
 # ── Config ─────────────────────────────────────────────────────────────────
 
 DEVICE = "cuda"
-BATCH_SIZE = 8
+BATCH_SIZE = 4
 NUM_STEPS = 20000
 LR = 1e-4
 WEIGHT_DECAY = 1e-5
@@ -26,30 +28,36 @@ MODEL_ID = "lerobot/pi0_libero_base"
 
 # ── Setup ──────────────────────────────────────────────────────────────────
 
-print(f"[setup] Loading pretrained PI0Policy from {MODEL_ID} ...")
+print(f"[setup] Loading config from {MODEL_ID} ...")
 t0 = time.time()
+config = PI0Config.from_pretrained(MODEL_ID)
+config.device = "cpu"  # keep on CPU during init — move to GPU once at the end
+print(f"[setup] Config loaded in {time.time()-t0:.1f}s")
 
-# Load pretrained weights via PI0Policy first, then swap the model
-base_policy = PI0Policy.from_pretrained(MODEL_ID)
-config = base_policy.config
-print(f"[setup] Pretrained policy loaded in {time.time()-t0:.1f}s")
-
-print("[setup] Building PI0PolicyMixedLayerAttention ...")
+print("[setup] Building PI0PolicyMixedLayerAttention on CPU ...")
 policy = PI0PolicyMixedLayerAttention(config)
 
-# Copy pretrained weights into the new model (strict=False — MLA + LoRA params are new)
-missing, unexpected = policy.model.load_state_dict(
-    base_policy.model.state_dict(), strict=False
-)
-print(f"[setup] Loaded pretrained weights — missing: {len(missing)}, unexpected: {len(unexpected)}")
+print("[setup] Loading pretrained weights from cache ...")
+weights_path = hf_hub_download(MODEL_ID, "model.safetensors")
+state_dict = load_file(weights_path, device="cpu")
+
+# Add "model." prefix to match policy.model.state_dict() keys
+remapped = {}
+for k, v in state_dict.items():
+    new_key = k if k.startswith("model.") else f"model.{k}"
+    remapped[new_key] = v
+
+missing, unexpected = policy.load_state_dict(remapped, strict=False)
+print(f"[setup] Weights loaded — missing: {len(missing)}, unexpected: {len(unexpected)}")
 if missing:
     print(f"  Missing (new params, expected): {missing[:5]}")
 if unexpected:
     print(f"  Unexpected: {unexpected[:5]}")
 
-del base_policy  # free memory
-torch.cuda.empty_cache()
+del state_dict, remapped  # free CPU memory
+import gc; gc.collect()
 
+print(f"[setup] Moving model to {DEVICE} ...")
 policy = policy.to(DEVICE)
 print(f"[setup] Model on {DEVICE}")
 
