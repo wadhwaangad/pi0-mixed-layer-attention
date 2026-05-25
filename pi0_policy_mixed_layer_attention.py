@@ -99,7 +99,8 @@ class PI0PytorchMixedLayerAttention(PI0Pytorch):
         gates         = []
         pre_ln_hiddens = []
 
-        paligemma_hiddens.append(inputs_embeds[0].detach())
+        # in pi0_policy_mixed_layer_attention.py
+        paligemma_hiddens.append(inputs_embeds[0].detach().cpu())
         use_mixed = True  # always at least one hidden now
         mixed_context, _ = self.mla(paligemma_hiddens, expert_layer_idx=layer_idx)
 
