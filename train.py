@@ -20,7 +20,8 @@ from pi0_policy_mixed_layer_attention import PI0PolicyMixedLayerAttention
 
 DEVICE = "cuda"
 BATCH_SIZE = 1
-NUM_STEPS = 20000
+ACCUM_STEPS = 4          # effective batch size = BATCH_SIZE * ACCUM_STEPS = 4
+NUM_STEPS = 20000        # optimizer steps (not forward passes)
 LR = 3e-5
 WEIGHT_DECAY = 1e-5
 GRAD_CLIP = 1.0
@@ -40,7 +41,7 @@ with open(config_path) as f:
     config_dict = json.load(f)
 
 config_dict.pop("type", None)
-config_dict["device"] = "cpu"   # keep on CPU during init
+config_dict["device"] = "cpu"
 config_dict["dtype"] = "bfloat16"
 
 for key, val in config_dict.get("input_features", {}).items():
@@ -80,7 +81,7 @@ del state_dict, remapped
 gc.collect()
 
 print(f"[setup] Moving model to {DEVICE} ...")
-config.device = DEVICE  # restore before moving
+config.device = DEVICE
 policy = policy.to(DEVICE)
 print(f"[setup] Model on {DEVICE}")
 print(f"[setup] GPU mem after model load: {torch.cuda.memory_allocated()/1e9:.1f}GB")
@@ -107,12 +108,10 @@ tokenizer = AutoTokenizer.from_pretrained("google/paligemma-3b-pt-224")
 print("[setup] Tokenizer ready")
 
 def tokenize_batch(batch, device):
-    """Tokenize task strings and add to batch. Moves tensors to device."""
     batch = {
         k: v.to(device) if isinstance(v, torch.Tensor) else v
         for k, v in batch.items()
     }
-    # Pi0 expects a newline appended to each task string
     tasks = [t + "\n" for t in batch["task"]]
     tokens = tokenizer(
         tasks,
@@ -131,7 +130,7 @@ print("[setup] Loading dataset ...")
 dataset = LeRobotDataset(
     "lerobot/libero",
     delta_timestamps={
-        "action": [i / 10 for i in range(50)],  
+        "action": [i / 10 for i in range(50)],
     },
 )
 print(f"[setup] Dataset size: {len(dataset)} samples")
@@ -161,33 +160,52 @@ trainable_names = {n for n, p in policy.model.named_parameters() if p.requires_g
 print(f"[setup] Trainable param names: {len(trainable_names)}")
 
 policy.train()
-step = 0
+optimizer.zero_grad()
+
+step = 0          # optimizer steps
+micro_step = 0    # forward pass count
 data_iter = iter(dataloader)
 step_times = []
 
-print("[train] Starting training loop ...")
+print(f"[train] Starting training — effective batch size: {BATCH_SIZE * ACCUM_STEPS}")
 
 while step < NUM_STEPS:
-    try:
-        batch = next(data_iter)
-    except StopIteration:
-        data_iter = iter(dataloader)
-        batch = next(data_iter)
-        print(f"[train] Restarted dataloader at step {step}")
-
-    batch = tokenize_batch(batch, DEVICE)
-
     t_step = time.time()
+    accum_loss = 0.0
 
-    loss, loss_dict = policy.forward(batch)
+    for accum_idx in range(ACCUM_STEPS):
+        try:
+            batch = next(data_iter)
+        except StopIteration:
+            data_iter = iter(dataloader)
+            batch = next(data_iter)
+            print(f"[train] Restarted dataloader at step {step}")
 
-    optimizer.zero_grad()
-    loss.backward()
+        batch = tokenize_batch(batch, DEVICE)
+        loss, loss_dict = policy.forward(batch)
+        loss = loss / ACCUM_STEPS
+        loss.backward()
+        accum_loss += loss.item()
+        micro_step += 1
+
     grad_norm = torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=GRAD_CLIP)
     optimizer.step()
+    optimizer.zero_grad()
 
     if step < WARMUP_STEPS:
         scheduler.step()
+
+    # grad check at step 0
+    if step == 0:
+        print("\n--- MLA gradient check ---")
+        for name, param in policy.model.mla.named_parameters():
+            g = param.grad
+            print(f"  mla.{name}: grad={'YES' if g is not None else 'NO'} norm={g.norm().item():.6f if g is not None else 0:.6f}")
+        for name, param in policy.model.named_parameters():
+            if '.A' in name or '.B' in name:
+                g = param.grad
+                print(f"  {name}: grad={'YES' if g is not None else 'NO'} norm={g.norm().item():.6f if g is not None else 0:.6f}")
+        print("--- end grad check ---\n")
 
     step_times.append(time.time() - t_step)
 
@@ -198,7 +216,7 @@ while step < NUM_STEPS:
         mem_res_gb = torch.cuda.memory_reserved() / 1e9
         print(
             f"[train] Step {step:06d}/{NUM_STEPS} | "
-            f"Loss: {loss.item():.4f} | "
+            f"Loss: {accum_loss:.4f} | "
             f"LR: {lr:.2e} | "
             f"GradNorm: {grad_norm:.3f} | "
             f"StepTime: {avg_step_ms:.0f}ms | "
