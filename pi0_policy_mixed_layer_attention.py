@@ -242,13 +242,6 @@ class PI0PytorchMixedLayerAttention(PI0Pytorch):
 
         pad_masks = torch.cat([prefix_pad_masks, suffix_pad_masks], dim=1)
         att_masks = torch.cat([prefix_att_masks, suffix_att_masks], dim=1)
-                # DEBUG
-        print(f"prefix_pad_masks: {prefix_pad_masks.shape}")
-        print(f"prefix_att_masks: {prefix_att_masks.shape}")
-        print(f"suffix_pad_masks: {suffix_pad_masks.shape}")
-        print(f"suffix_att_masks: {suffix_att_masks.shape}")
-        print(f"pad_masks: {pad_masks.shape}")
-        print(f"att_masks: {att_masks.shape}")
         att_2d_masks = make_att_2d_masks(pad_masks, att_masks)
         position_ids = torch.cumsum(pad_masks, dim=1) - 1
         att_2d_masks_4d = self._prepare_attention_masks_4d(att_2d_masks)
