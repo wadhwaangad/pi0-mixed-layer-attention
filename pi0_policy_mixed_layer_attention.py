@@ -37,6 +37,7 @@ class LoRALinear(nn.Module):
         self.A = nn.Parameter(torch.empty(in_dim, rank))
         self.B = nn.Parameter(torch.zeros(rank, out_dim))
         nn.init.kaiming_uniform_(self.A, a=math.sqrt(5))
+        self.rank = rank
 
     def forward(self, x):
         return self.linear(x) + (x @ self.A.to(x.dtype) @ self.B.to(x.dtype)) / self.rank
