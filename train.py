@@ -21,7 +21,7 @@ from pi0_policy_mixed_layer_attention import PI0PolicyMixedLayerAttention
 DEVICE = "cuda"
 BATCH_SIZE = 1
 NUM_STEPS = 20000
-LR = 1e-4
+LR = 3e-5
 WEIGHT_DECAY = 1e-5
 GRAD_CLIP = 1.0
 LOG_EVERY = 100
