@@ -39,9 +39,9 @@ class MixedLayerAttention(nn.Module):
         weights = F.softmax(self.layer_logits[i], dim=0)  # (i+1,)
         
         # Incremental weighted sum — never materializes the full stacked tensor
-        mixed = torch.zeros_like(paligemma_hiddens[0])
+        mixed = torch.zeros_like(paligemma_hiddens[-1].to(self.gamma.device))
         for j, h in enumerate(paligemma_hiddens[:i + 1]):
-            mixed = mixed + weights[j] * h
+            mixed = mixed + weights[j] * h.to(mixed.device)
     
         return self.gamma[i] * mixed, weights.detach()
 
