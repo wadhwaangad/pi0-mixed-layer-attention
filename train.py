@@ -19,7 +19,7 @@ from pi0_policy_mixed_layer_attention import PI0PolicyMixedLayerAttention
 # ── Config ─────────────────────────────────────────────────────────────────
 
 DEVICE = "cuda"
-BATCH_SIZE = 2
+BATCH_SIZE = 1
 NUM_STEPS = 20000
 LR = 1e-4
 WEIGHT_DECAY = 1e-5
