@@ -23,7 +23,7 @@ ACTION_EXPERT_LAYERS = 18
 class LoRALinear(nn.Module):
     """
     LoRA adapter for a frozen linear layer.
-    output = frozen(x) + (x @ A @ B)
+    output = frozen(x) + (x @ A @ B) / rank
     B initialized to zero so adapter contributes nothing at init.
     """
     def __init__(self, linear: nn.Linear, rank: int = 16):
@@ -100,9 +100,7 @@ class PI0PytorchMixedLayerAttention(PI0Pytorch):
         gates         = []
         pre_ln_hiddens = []
 
-        # in pi0_policy_mixed_layer_attention.py
-        paligemma_hiddens.append(inputs_embeds[0].detach().cpu
-        use_mixed = True  # always at least one hidden now
+        use_mixed = len(paligemma_hiddens) > 0
         mixed_context, _ = self.mla(paligemma_hiddens, expert_layer_idx=layer_idx)
 
         for i, hidden_states in enumerate(inputs_embeds):
@@ -138,6 +136,7 @@ class PI0PytorchMixedLayerAttention(PI0Pytorch):
                         .view(mixed_shape).transpose(1, 2)
                     )
                 else:
+                    # layer 0: no prior hiddens, fall back to self-attention
                     key_state = (
                         layer.self_attn.k_proj(hidden_states)
                         .view(hidden_shape).transpose(1, 2)
@@ -215,6 +214,11 @@ class PI0PytorchMixedLayerAttention(PI0Pytorch):
             outputs_embeds.append(out_emb)
             start_pos = end_pos
 
+        # store post-layer paligemma hidden, keeping it in the grad graph
+        h = outputs_embeds[0]
+        if not h.requires_grad:
+            h = h.detach().requires_grad_(True)
+        paligemma_hiddens.append(h)
         return outputs_embeds
 
     def forward(
