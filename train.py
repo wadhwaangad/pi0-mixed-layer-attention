@@ -59,6 +59,7 @@ print(f"[setup] Config loaded in {time.time()-t0:.1f}s")
 
 print("[setup] Building PI0PolicyMixedLayerAttention on CPU ...")
 policy = PI0PolicyMixedLayerAttention(config)
+policy.model.gradient_checkpointing_enable()
 
 print("[setup] Loading pretrained weights from cache ...")
 weights_path = hf_hub_download(MODEL_ID, "model.safetensors")
