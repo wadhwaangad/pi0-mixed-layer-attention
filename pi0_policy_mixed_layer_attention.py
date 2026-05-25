@@ -101,10 +101,7 @@ class PI0PytorchMixedLayerAttention(PI0Pytorch):
         pre_ln_hiddens = []
 
         # in pi0_policy_mixed_layer_attention.py
-        h = outputs_embeds[0]
-        if not h.requires_grad:
-            h = h.detach().requires_grad_(True)
-        paligemma_hiddens.append(h)
+        paligemma_hiddens.append(inputs_embeds[0].detach().cpu
         use_mixed = True  # always at least one hidden now
         mixed_context, _ = self.mla(paligemma_hiddens, expert_layer_idx=layer_idx)
 
