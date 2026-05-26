@@ -184,16 +184,6 @@ while step < NUM_STEPS:
         batch = tokenize_batch(batch, DEVICE)
         loss, loss_dict = policy.forward(batch)
         loss = loss / ACCUM_STEPS
-        if step == 0:
-            print("\n--- MLA gradient check ---")
-            for name, param in policy.model.mla.named_parameters():
-                g = param.grad
-                print(f"  mla.{name}: grad={'YES' if g is not None else 'NO'} norm={g.norm().item():.6f if g is not None else 0:.6f}")
-            for name, param in policy.model.named_parameters():
-                if '.A' in name or '.B' in name:
-                    g = param.grad
-                    print(f"  {name}: grad={'YES' if g is not None else 'NO'} norm={g.norm().item():.6f if g is not None else 0:.6f}")
-            print("--- end grad check ---\n")
         loss.backward()
         accum_loss += loss.item()
         micro_step += 1
