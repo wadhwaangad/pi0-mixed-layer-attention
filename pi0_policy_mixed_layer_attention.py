@@ -100,8 +100,12 @@ class PI0PytorchMixedLayerAttention(PI0Pytorch):
         gates         = []
         pre_ln_hiddens = []
 
+        # get MLA weights for this layer (softmax over i+1 past hiddens)
         use_mixed = len(paligemma_hiddens) > 0
-        mixed_context, _ = self.mla(paligemma_hiddens, expert_layer_idx=layer_idx)
+        _, weights = self.mla(paligemma_hiddens, expert_layer_idx=layer_idx)
+        # weights is (i+1,) softmax weights, gamma is scalar
+
+        paligemma_layer = paligemma.model.language_model.layers[layer_idx]
 
         for i, hidden_states in enumerate(inputs_embeds):
             layer = models[i].layers[layer_idx]
@@ -116,27 +120,48 @@ class PI0PytorchMixedLayerAttention(PI0Pytorch):
             hidden_shape = (*input_shape, -1, layer.self_attn.head_dim)
 
             if i == 0:
+                # Q from current paligemma hidden
                 query_state = (
                     layer.self_attn.q_proj(hidden_states)
                     .view(hidden_shape).transpose(1, 2)
                 )
+
                 if use_mixed:
-                    mixed_normed, _ = layernorm_forward(
-                        layer.input_layernorm,
-                        mixed_context.to(dtype=hidden_states.dtype),
-                        adarms_cond[i]
-                    )
-                    mixed_shape = (*mixed_normed.shape[:-1], -1, layer.self_attn.head_dim)
-                    key_state = (
-                        layer.self_attn.k_proj(mixed_normed)
-                        .view(mixed_shape).transpose(1, 2)
-                    )
-                    value_state = (
-                        layer.self_attn.v_proj(mixed_normed)
-                        .view(mixed_shape).transpose(1, 2)
-                    )
+                    # Mix K/V projections across past layers
+                    # For each past hidden h_j, project through layer j's own k/v proj
+                    # then take weighted sum — no distribution mismatch
+                    gamma = self.mla.gamma[layer_idx]
+                    key_state = None
+                    value_state = None
+                    for j, h_j in enumerate(paligemma_hiddens):
+                        past_layer = paligemma.model.language_model.layers[j]
+                        # layernorm h_j through its own layer's layernorm
+                        h_j_normed, _ = layernorm_forward(
+                            past_layer.input_layernorm,
+                            h_j.to(dtype=hidden_states.dtype),
+                            None  # paligemma has no adarms
+                        )
+                        past_shape = (*h_j_normed.shape[:-1], -1, past_layer.self_attn.head_dim)
+                        k_j = (
+                            past_layer.self_attn.k_proj(h_j_normed)
+                            .view(past_shape).transpose(1, 2)
+                        )
+                        v_j = (
+                            past_layer.self_attn.v_proj(h_j_normed)
+                            .view(past_shape).transpose(1, 2)
+                        )
+                        w_j = weights[j]
+                        if key_state is None:
+                            key_state = w_j * k_j
+                            value_state = w_j * v_j
+                        else:
+                            key_state = key_state + w_j * k_j
+                            value_state = value_state + w_j * v_j
+
+                    key_state = gamma * key_state
+                    value_state = gamma * value_state
                 else:
-                    # layer 0: no prior hiddens, fall back to self-attention
+                    # layer 0: no past hiddens, fall back to self-attention
                     key_state = (
                         layer.self_attn.k_proj(hidden_states)
                         .view(hidden_shape).transpose(1, 2)
@@ -146,6 +171,7 @@ class PI0PytorchMixedLayerAttention(PI0Pytorch):
                         .view(hidden_shape).transpose(1, 2)
                     )
             else:
+                # expert: normal self-attention
                 query_state = (
                     layer.self_attn.q_proj(hidden_states)
                     .view(hidden_shape).transpose(1, 2)
@@ -180,10 +206,10 @@ class PI0PytorchMixedLayerAttention(PI0Pytorch):
         )
 
         batch_size = query_states.shape[0]
-        scaling = paligemma.model.language_model.layers[layer_idx].self_attn.scaling
+        scaling = paligemma_layer.self_attn.scaling
 
         att_output, _ = modeling_gemma.eager_attention_forward(
-            paligemma.model.language_model.layers[layer_idx].self_attn,
+            paligemma_layer.self_attn,
             query_states,
             key_states,
             value_states,
@@ -191,8 +217,9 @@ class PI0PytorchMixedLayerAttention(PI0Pytorch):
             scaling,
         )
 
-        head_dim = paligemma.model.language_model.layers[layer_idx].self_attn.head_dim
-        att_output = att_output.reshape(batch_size, -1, 1 * 8 * head_dim)
+        head_dim = paligemma_layer.self_attn.head_dim
+        num_heads = paligemma_layer.self_attn.num_heads
+        att_output = att_output.reshape(batch_size, -1, num_heads * head_dim)
 
         outputs_embeds = []
         start_pos = 0
