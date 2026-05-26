@@ -242,10 +242,7 @@ class PI0PytorchMixedLayerAttention(PI0Pytorch):
             start_pos = end_pos
 
         # store post-layer paligemma hidden, keeping it in the grad graph
-        h = outputs_embeds[0]
-        if not h.requires_grad:
-            h = h.detach().requires_grad_(True)
-        paligemma_hiddens.append(h)
+        paligemma_hiddens.append(outputs_embeds[0])
         return outputs_embeds
 
     def forward(
