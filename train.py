@@ -184,6 +184,14 @@ while step < NUM_STEPS:
         batch = tokenize_batch(batch, DEVICE)
         loss, loss_dict = policy.forward(batch)
         loss = loss / ACCUM_STEPS
+        found_grad = False
+        for name, p in model.named_parameters():
+            if p.requires_grad and p.grad is not None:
+                print(f"FOUND GRAD: {name}")
+                found_grad = True
+                break
+        if not found_grad:
+            print("NO TRAINABLE GRADS FOUND")
         loss.backward()
         accum_loss += loss.item()
         micro_step += 1
