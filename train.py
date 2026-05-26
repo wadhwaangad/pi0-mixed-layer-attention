@@ -19,8 +19,8 @@ from pi0_policy_mixed_layer_attention import PI0PolicyMixedLayerAttention
 # ── Config ─────────────────────────────────────────────────────────────────
 
 DEVICE = "cuda"
-BATCH_SIZE = 1
-ACCUM_STEPS = 4          # effective batch size = BATCH_SIZE * ACCUM_STEPS = 4
+BATCH_SIZE = 2
+ACCUM_STEPS = 2          # effective batch size = BATCH_SIZE * ACCUM_STEPS = 4
 NUM_STEPS = 20000        # optimizer steps (not forward passes)
 LR = 3e-5
 WEIGHT_DECAY = 1e-5
