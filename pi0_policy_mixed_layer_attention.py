@@ -217,9 +217,7 @@ class PI0PytorchMixedLayerAttention(PI0Pytorch):
             scaling,
         )
 
-        head_dim = paligemma_layer.self_attn.head_dim
-        num_heads = paligemma_layer.self_attn.num_heads
-        att_output = att_output.reshape(batch_size, -1, num_heads * head_dim)
+        att_output = att_output.flatten(start_dim=2) if att_output.dim() == 4 else att_output
 
         outputs_embeds = []
         start_pos = 0
