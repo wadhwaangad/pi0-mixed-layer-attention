@@ -56,8 +56,8 @@ class PI0PytorchMixedLayerAttention(PI0Pytorch):
 
         # K/V cache: maps past paligemma layer index -> (k, v) tensors.
         # Populated lazily during a forward pass, cleared at the start of each
-        # new forward call. Each entry is computed exactly once regardless of
-        # how many subsequent layers reference it (O(N) instead of O(N^2)).
+        # new forward call. Hiddens are detached before caching so the backward
+        # graph doesn't grow triangularly across layers.
         self._kv_cache: dict[int, tuple[Tensor, Tensor]] = {}
 
     def _freeze_all(self):
@@ -98,32 +98,20 @@ class PI0PytorchMixedLayerAttention(PI0Pytorch):
         """
         Return the K/V projections for past paligemma layer j.
 
-        On the first call for a given j within a forward pass the projections
-        are computed and stored in self._kv_cache[j]. Every subsequent call
-        for the same j just returns the cached tensors — no recomputation.
-
-        Args:
-            j:          Index of the past paligemma layer.
-            h_j:        Post-layer hidden state from layer j  (already in
-                        paligemma_hiddens[j]).
-            paligemma:  The paligemma sub-model (for layer weights).
-            ref_dtype:  dtype of the current layer's hidden states, used to
-                        cast h_j before projection so dtypes stay consistent.
-
-        Returns:
-            (k_j, v_j) tensors shaped (B, heads, seq, head_dim).
+        h_j is detached before projection so gradients don't flow back through
+        earlier hidden states — the only gradient path for MLA weights is
+        through the softmax weights themselves, not through the K/V values.
+        This breaks the triangular graph that was making backward O(N^2).
         """
         if j in self._kv_cache:
             return self._kv_cache[j]
 
         past_layer = paligemma.model.language_model.layers[j]
 
-        # Normalise h_j through its *own* layer's layernorm so there is no
-        # distribution mismatch when projecting into K/V space.
         h_j_normed, _ = layernorm_forward(
             past_layer.input_layernorm,
-            h_j.to(dtype=ref_dtype),
-            None,  # paligemma has no adarms conditioning
+            h_j.detach().to(dtype=ref_dtype),  # detach: no grad through past hiddens
+            None,
         )
         past_shape = (*h_j_normed.shape[:-1], -1, past_layer.self_attn.head_dim)
 
@@ -159,10 +147,8 @@ class PI0PytorchMixedLayerAttention(PI0Pytorch):
         gates         = []
         pre_ln_hiddens = []
 
-        # get MLA weights for this layer (softmax over i+1 past hiddens)
         use_mixed = len(paligemma_hiddens) > 0
         _, weights = self.mla(paligemma_hiddens, expert_layer_idx=layer_idx)
-        # weights is (i+1,) softmax weights, gamma is scalar
 
         paligemma_layer = paligemma.model.language_model.layers[layer_idx]
 
@@ -179,17 +165,12 @@ class PI0PytorchMixedLayerAttention(PI0Pytorch):
             hidden_shape = (*input_shape, -1, layer.self_attn.head_dim)
 
             if i == 0:
-                # Q from current paligemma hidden
                 query_state = (
                     layer.self_attn.q_proj(hidden_states)
                     .view(hidden_shape).transpose(1, 2)
                 )
 
                 if use_mixed:
-                    # Mix K/V projections across past layers using the cache.
-                    # _get_cached_kv ensures each past layer j is projected at
-                    # most once per forward pass (153 → 18 projections for 18
-                    # layers), then takes the softmax-weighted sum.
                     gamma = self.mla.gamma[layer_idx]
                     key_state   = None
                     value_state = None
@@ -209,7 +190,6 @@ class PI0PytorchMixedLayerAttention(PI0Pytorch):
                     key_state   = gamma * key_state
                     value_state = gamma * value_state
                 else:
-                    # layer 0: no past hiddens, fall back to self-attention
                     key_state = (
                         layer.self_attn.k_proj(hidden_states)
                         .view(hidden_shape).transpose(1, 2)
@@ -219,7 +199,6 @@ class PI0PytorchMixedLayerAttention(PI0Pytorch):
                         .view(hidden_shape).transpose(1, 2)
                     )
             else:
-                # expert: normal self-attention (never uses MLA)
                 query_state = (
                     layer.self_attn.q_proj(hidden_states)
                     .view(hidden_shape).transpose(1, 2)
@@ -287,11 +266,9 @@ class PI0PytorchMixedLayerAttention(PI0Pytorch):
             outputs_embeds.append(out_emb)
             start_pos = end_pos
 
-        # Store post-layer paligemma hidden in the grad graph.
-        # NOTE: _kv_cache for index layer_idx will be populated on the *next*
-        # layer's call to _get_cached_kv, not here, so the hidden state is
-        # fully computed before we try to project it.
-        paligemma_hiddens.append(outputs_embeds[0])
+        # Detach before storing so the K/V cache and future layers don't
+        # hold references into the full backward graph of earlier layers.
+        paligemma_hiddens.append(outputs_embeds[0].detach())
         return outputs_embeds
 
     def forward(
@@ -299,9 +276,6 @@ class PI0PytorchMixedLayerAttention(PI0Pytorch):
         state, actions, noise, time
     ) -> Tensor:
 
-        # Clear the K/V cache at the start of every forward pass so stale
-        # tensors from the previous call (different batch / different sequence
-        # length) are never reused.
         self._kv_cache.clear()
 
         time_expanded = time[:, None, None]
