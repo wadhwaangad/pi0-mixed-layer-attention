@@ -184,16 +184,6 @@ data_iter = iter(dataloader)
 step_times = []
 
 print(f"[train] Starting training — effective batch size: {BATCH_SIZE * ACCUM_STEPS}")
-#---debug-----
-with torch.profiler.profile(
-    activities=[torch.profiler.ProfilerActivity.CUDA],
-    record_shapes=True,
-) as prof:
-    loss, loss_dict = policy.forward(batch)
-    loss.backward()
-
-print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=20))
-#----------------------------------------------------------------------------
 
 while step < NUM_STEPS:
     t_step = time.time()
