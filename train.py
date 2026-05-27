@@ -23,8 +23,8 @@ DEVICE = "cuda"
 BATCH_SIZE = 2
 ACCUM_STEPS = 2          # effective batch size = BATCH_SIZE * ACCUM_STEPS = 4
 NUM_STEPS = 20000        # optimizer steps (not forward passes)
-LR = 3e-5
-LR_MLA = 1e-2            # higher LR for the tiny MLA param set (189 params)
+LR = 3e-4
+LR_MLA = 3e-3            # higher LR for the tiny MLA param set (189 params)
 WEIGHT_DECAY = 1e-5
 GRAD_CLIP = 1.0
 LOG_EVERY = 10
