@@ -88,32 +88,6 @@ policy = policy.to(DEVICE)
 print(f"[setup] Model on {DEVICE}")
 print(f"[setup] GPU mem after model load: {torch.cuda.memory_allocated()/1e9:.1f}GB")
 
-# ── Gradient checkpointing ─────────────────────────────────────────────────
-# Recomputes activations during backward instead of storing them, trading
-# compute for memory. Applied to the two transformer stacks inside the model.
-
-def _enable_gradient_checkpointing(policy):
-    paligemma = policy.model.paligemma_with_expert.paligemma
-    gemma_expert = policy.model.paligemma_with_expert.gemma_expert
-
-    # PaliGemma language model layers
-    for layer in paligemma.model.language_model.layers:
-        layer.gradient_checkpointing = True
-
-    # Action expert layers
-    for layer in gemma_expert.model.layers:
-        layer.gradient_checkpointing = True
-
-    # If the models expose the HF-style flag, set it too
-    if hasattr(paligemma.model.language_model, "gradient_checkpointing"):
-        paligemma.model.language_model.gradient_checkpointing = True
-    if hasattr(gemma_expert.model, "gradient_checkpointing"):
-        gemma_expert.model.gradient_checkpointing = True
-
-    print("[setup] Gradient checkpointing enabled on both transformer stacks")
-
-_enable_gradient_checkpointing(policy)
-
 # ── Optimizer ──────────────────────────────────────────────────────────────
 
 # Split params into two groups: tiny MLA logits get a much higher LR so the
