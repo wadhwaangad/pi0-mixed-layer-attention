@@ -7,6 +7,7 @@ import time
 import torch
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import LinearLR
+from torch.utils.checkpoint import checkpoint
 from lerobot.policies.pi0 import PI0Config
 from lerobot.configs.types import FeatureType, PolicyFeature
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
@@ -23,6 +24,7 @@ BATCH_SIZE = 2
 ACCUM_STEPS = 2          # effective batch size = BATCH_SIZE * ACCUM_STEPS = 4
 NUM_STEPS = 20000        # optimizer steps (not forward passes)
 LR = 3e-5
+LR_MLA = 1e-2            # higher LR for the tiny MLA param set (189 params)
 WEIGHT_DECAY = 1e-5
 GRAD_CLIP = 1.0
 LOG_EVERY = 10
@@ -86,14 +88,54 @@ policy = policy.to(DEVICE)
 print(f"[setup] Model on {DEVICE}")
 print(f"[setup] GPU mem after model load: {torch.cuda.memory_allocated()/1e9:.1f}GB")
 
+# ── Gradient checkpointing ─────────────────────────────────────────────────
+# Recomputes activations during backward instead of storing them, trading
+# compute for memory. Applied to the two transformer stacks inside the model.
+
+def _enable_gradient_checkpointing(policy):
+    paligemma = policy.model.paligemma_with_expert.paligemma
+    gemma_expert = policy.model.paligemma_with_expert.gemma_expert
+
+    # PaliGemma language model layers
+    for layer in paligemma.model.language_model.layers:
+        layer.gradient_checkpointing = True
+
+    # Action expert layers
+    for layer in gemma_expert.model.layers:
+        layer.gradient_checkpointing = True
+
+    # If the models expose the HF-style flag, set it too
+    if hasattr(paligemma.model.language_model, "gradient_checkpointing"):
+        paligemma.model.language_model.gradient_checkpointing = True
+    if hasattr(gemma_expert.model, "gradient_checkpointing"):
+        gemma_expert.model.gradient_checkpointing = True
+
+    print("[setup] Gradient checkpointing enabled on both transformer stacks")
+
+_enable_gradient_checkpointing(policy)
+
 # ── Optimizer ──────────────────────────────────────────────────────────────
 
-trainable_params = [p for p in policy.parameters() if p.requires_grad]
-total_trainable = sum(p.numel() for p in trainable_params)
+# Split params into two groups: tiny MLA logits get a much higher LR so the
+# softmax weights actually differentiate; LoRA params use the base LR.
+mla_param_ids = {id(p) for p in policy.model.mla.parameters()}
+mla_params  = [p for p in policy.parameters() if p.requires_grad and id(p) in mla_param_ids]
+lora_params = [p for p in policy.parameters() if p.requires_grad and id(p) not in mla_param_ids]
+
+total_trainable = sum(p.numel() for p in policy.parameters() if p.requires_grad)
 total_frozen    = sum(p.numel() for p in policy.parameters() if not p.requires_grad)
 print(f"[setup] Trainable: {total_trainable/1e6:.3f}M | Frozen: {total_frozen/1e6:.1f}M")
+print(f"[setup] MLA params: {sum(p.numel() for p in mla_params)} | LoRA params: {sum(p.numel() for p in lora_params)/1e6:.3f}M")
 
-optimizer = AdamW(trainable_params, lr=LR, weight_decay=WEIGHT_DECAY)
+optimizer = AdamW(
+    [
+        {"params": mla_params,  "lr": LR_MLA},
+        {"params": lora_params, "lr": LR},
+    ],
+    weight_decay=WEIGHT_DECAY,
+)
+
+# Warmup applies to both param groups
 scheduler = LinearLR(
     optimizer,
     start_factor=1e-8,
@@ -162,8 +204,8 @@ print(f"[setup] Trainable param names: {len(trainable_names)}")
 policy.train()
 optimizer.zero_grad()
 
-step = 0          # optimizer steps
-micro_step = 0    # forward pass count
+step = 0
+micro_step = 0
 data_iter = iter(dataloader)
 step_times = []
 
@@ -188,26 +230,35 @@ while step < NUM_STEPS:
         accum_loss += loss.item()
         micro_step += 1
 
-    grad_norm = torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=GRAD_CLIP)
+    grad_norm = torch.nn.utils.clip_grad_norm_(
+        [p for p in policy.parameters() if p.requires_grad], max_norm=GRAD_CLIP
+    )
     optimizer.step()
     optimizer.zero_grad()
 
     if step < WARMUP_STEPS:
         scheduler.step()
-    
 
     step_times.append(time.time() - t_step)
 
     if step % LOG_EVERY == 0:
-        lr = optimizer.param_groups[0]["lr"]
+        lr_lora = optimizer.param_groups[1]["lr"]
+        lr_mla  = optimizer.param_groups[0]["lr"]
         avg_step_ms = (sum(step_times[-LOG_EVERY:]) / max(len(step_times[-LOG_EVERY:]), 1)) * 1000
         mem_gb = torch.cuda.memory_allocated() / 1e9
         mem_res_gb = torch.cuda.memory_reserved() / 1e9
+
+        # Log MLA logit spread to verify weights are differentiating
+        with torch.no_grad():
+            last_logits = policy.model.mla.layer_logits[-1].float()
+            logit_std = last_logits.std().item()
+
         print(
             f"[train] Step {step:06d}/{NUM_STEPS} | "
             f"Loss: {accum_loss:.4f} | "
-            f"LR: {lr:.2e} | "
+            f"LR lora: {lr_lora:.2e} MLA: {lr_mla:.2e} | "
             f"GradNorm: {grad_norm:.3f} | "
+            f"LogitStd[17]: {logit_std:.4f} | "
             f"StepTime: {avg_step_ms:.0f}ms | "
             f"GPU mem: {mem_gb:.1f}GB alloc / {mem_res_gb:.1f}GB reserved"
         )
