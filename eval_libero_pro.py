@@ -1,30 +1,49 @@
 """
 eval_libero_pro.py — Full LIBERO-PRO evaluation for PI0 + MixedLayerAttention.
 
-Evaluates BOTH the MLA checkpoint AND vanilla pi0 baseline side by side,
-across all 4 perturbation types, 3 episodes per task.
+Evaluates the MLA checkpoint across all 4 official task suites and 5 perturbation
+types (20 suite×perturbation combinations), 3 episodes per task.
+
 Saves progress after every task — fully resumable after preemption.
 
-Expected runtime on spot A100: ~27 hours. Expected cost: ~$32.
+Official benchmark structure (Zxy-MLlab/LIBERO-PRO):
+  Suites      : libero_goal, libero_spatial, libero_10, libero_object  (10 tasks each)
+  Perturbations: object, position, semantic, task, environment         (5 types)
+  Combinations: 4 × 5 = 20   (task cannot be combined with others)
+  Total tasks : 4 × 10 × 5 = 200 (× 3 episodes = 600 rollouts)
+
+Per-suite max steps (from official TASK_MAX_STEPS):
+  libero_goal    : 300
+  libero_spatial : 220
+  libero_10      : 520
+  libero_object  : 280
+
+Perturbation flag → suite suffix mapping (from evaluation_config.yaml):
+  use_swap        (position)    → _swap
+  use_object      (object)      → _object
+  use_language    (semantic)    → _lan
+  use_task        (task)        → _task
+  use_environment (environment) → _env
 
 Usage:
-    # Sanity check first (always do this before the full run)
-    python eval_libero_pro.py \
-        --checkpoint ./outputs/mixed_layer_attention/checkpoint_006000/model.pt \
+    # Sanity check first
+    python eval_libero_pro.py \\
+        --checkpoint ./outputs/mixed_layer_attention/checkpoint_006000/model.pt \\
         --dry_run
 
-    # Full run — both models, all 4 perturbations, 3 episodes
-    python eval_libero_pro.py \
+    # Full benchmark — all 4 suites, all 5 perturbations, 3 episodes
+    python eval_libero_pro.py \\
         --checkpoint ./outputs/mixed_layer_attention/checkpoint_006000/model.pt
 
     # Resume after preemption
-    python eval_libero_pro.py \
-        --checkpoint ./outputs/mixed_layer_attention/checkpoint_006000/model.pt \
+    python eval_libero_pro.py \\
+        --checkpoint ./outputs/mixed_layer_attention/checkpoint_006000/model.pt \\
         --resume
 
-    # Specific perturbations only
-    python eval_libero_pro.py \
-        --checkpoint ./outputs/mixed_layer_attention/checkpoint_006000/model.pt \
+    # Specific suites / perturbations only
+    python eval_libero_pro.py \\
+        --checkpoint ./outputs/mixed_layer_attention/checkpoint_006000/model.pt \\
+        --suites libero_goal libero_spatial \\
         --perturbations position object
 """
 
@@ -47,10 +66,45 @@ from pi0_policy_mixed_layer_attention import PI0PolicyMixedLayerAttention
 
 # ── Constants ────────────────────────────────────────────────────────────────
 
-MODEL_ID          = "lerobot/pi0_libero_base"
-NUM_EPISODES      = 3
-ALL_PERTURBATIONS = ["position", "object", "language", "task"]
-MAX_EPISODE_STEPS = 600   # hard cap per episode to avoid infinite loops
+MODEL_ID = "lerobot/pi0_libero_base"
+NUM_EPISODES = 3
+
+# Official leaderboard suites (10 tasks each)
+ALL_SUITES = ["libero_goal", "libero_spatial", "libero_10", "libero_object"]
+
+# Official per-suite max steps from TASK_MAX_STEPS in run_libero_eval.py
+SUITE_MAX_STEPS = {
+    "libero_goal":    300,
+    "libero_spatial": 220,
+    "libero_10":      520,
+    "libero_object":  280,
+}
+
+# All 5 perturbation types
+ALL_PERTURBATIONS = ["position", "object", "semantic", "task", "environment"]
+
+# Official flag mapping (evaluation_config.yaml — Zxy-MLlab/LIBERO-PRO)
+#   use_swap        → position generalization
+#   use_object      → object generalization
+#   use_language    → semantic/language generalization
+#   use_task        → task generalization
+#   use_environment → environment generalization
+PERTURBATION_TO_FLAG = {
+    "position":    "use_swap",
+    "object":      "use_object",
+    "semantic":    "use_language",
+    "task":        "use_task",
+    "environment": "use_environment",
+}
+
+# Official suite-name suffixes (perturbation_mapping in evaluation_config.yaml)
+PERTURBATION_TO_SUFFIX = {
+    "position":    "swap",
+    "object":      "object",
+    "semantic":    "lan",
+    "task":        "task",
+    "environment": "env",
+}
 
 # ── Model ────────────────────────────────────────────────────────────────────
 
@@ -142,14 +196,68 @@ def save_progress(path: str, results: dict):
         json.dump(results, f, indent=2)
 
 
+# ── Perturbed suite setup ─────────────────────────────────────────────────────
+
+def ensure_perturbed_suite(
+    suite: str,
+    perturbation: str,
+    bddl_base: str,
+    init_base: str,
+) -> str:
+    """
+    Pre-generate the perturbed task suite via LIBERO-PRO's perturbation.create_env().
+    Returns the perturbed suite name e.g. 'libero_goal_swap'.
+
+    Follows the official LIBERO-PRO setup flow: perturbations are baked into
+    bddl/init files ahead of time, NOT passed as live flags into OffScreenRenderEnv.
+    Note: task cannot be combined with other perturbations (official constraint).
+    """
+    try:
+        from LIBERO_PRO import perturbation as libero_perturbation
+    except ImportError:
+        raise ImportError(
+            "LIBERO-PRO not installed.\n"
+            "  git clone https://github.com/Zxy-MLlab/LIBERO-PRO\n"
+            "  cd LIBERO-PRO && pip install -e ."
+        )
+
+    flag_key        = PERTURBATION_TO_FLAG[perturbation]
+    suffix          = PERTURBATION_TO_SUFFIX[perturbation]
+    perturbed_suite = f"{suite}_{suffix}"
+
+    init_path = os.path.join(init_base, perturbed_suite)
+    bddl_path = os.path.join(bddl_base, perturbed_suite)
+
+    if os.path.exists(init_path) and os.path.exists(bddl_path):
+        print(f"[setup] Suite already exists: {perturbed_suite}")
+        return perturbed_suite
+
+    print(f"[setup] Generating perturbed suite: {perturbed_suite} ...")
+    evaluation_cfg = {
+        "bddl_files_path": bddl_base,
+        "init_file_dir":   init_base,
+        "task_suite_name": suite,
+        # Only one flag active at a time (official constraint for single perturbation)
+        "use_swap":        flag_key == "use_swap",
+        "use_object":      flag_key == "use_object",
+        "use_language":    flag_key == "use_language",
+        "use_task":        flag_key == "use_task",
+        "use_environment": flag_key == "use_environment",
+    }
+    libero_perturbation.create_env(configs=evaluation_cfg)
+    print(f"[setup] Done — suite: {perturbed_suite}")
+    return perturbed_suite
+
+
 # ── Episode rollout ───────────────────────────────────────────────────────────
 
-def run_episode(policy, env, lang_tokens, device, config):
+def run_episode(policy, env, lang_tokens, device, config, max_steps: int) -> bool:
     """Run one episode. Returns True if successful."""
-    obs        = env.reset()
-    ep_success = False
+    obs         = env.reset()
+    ep_success  = False
+    steps_taken = 0
 
-    for _ in range(MAX_EPISODE_STEPS // config.chunk_size + 1):
+    while steps_taken < max_steps:
         obs_tensor = {
             "observation.image": torch.from_numpy(
                 obs["agentview_image"].transpose(2, 0, 1)[None]
@@ -169,54 +277,51 @@ def run_episode(policy, env, lang_tokens, device, config):
         with torch.no_grad():
             action = policy.select_action(obs_tensor)
 
-        # Step through the chunk
         action_np = action.cpu().numpy().squeeze(0)
         for step_action in action_np:
             obs, _reward, done, info = env.step(step_action)
+            steps_taken += 1
             ep_success = ep_success or bool(info.get("success", False))
-            if done or ep_success:
+            if done or ep_success or steps_taken >= max_steps:
                 return ep_success
 
     return ep_success
 
 
-# ── Perturbation eval ─────────────────────────────────────────────────────────
+# ── Single suite × perturbation eval ─────────────────────────────────────────
 
-def run_perturbation(
+def run_combo(
     policy,
     config,
     tokenizer,
+    suite: str,
     perturbation: str,
     num_episodes: int,
     device: str,
     seed: int,
     progress_path: str,
     resume: bool,
-    label: str,
+    bddl_base: str,
+    init_base: str,
 ) -> dict:
     try:
         from libero.libero import benchmark as libero_benchmark
         from libero.libero.envs import OffScreenRenderEnv
     except ImportError:
         raise ImportError(
-            "LIBERO-PRO not installed.\n"
-            "  git clone https://github.com/Zxy-MLlab/LIBERO-PRO\n"
-            "  cd LIBERO-PRO && pip install -e ."
+            "LIBERO not installed. Follow LIBERO-PRO setup instructions."
         )
 
-    # Map perturbation name to LIBERO-PRO env flags
-    perturbation_flags = {
-        "use_swap":     perturbation == "object",
-        "use_object":   perturbation == "position",
-        "use_language": perturbation == "language",
-        "use_task":     perturbation == "task",
-    }
+    max_steps = SUITE_MAX_STEPS[suite]
 
-    benchmark  = libero_benchmark.get_benchmark_dict()["libero_90"]()
+    # Pre-generate the perturbed suite (official LIBERO-PRO flow)
+    perturbed_suite = ensure_perturbed_suite(suite, perturbation, bddl_base, init_base)
+
+    benchmark  = libero_benchmark.get_benchmark_dict()[perturbed_suite]()
     task_names = benchmark.get_task_names()
 
-    print(f"\n[eval] {label} | perturbation={perturbation} | "
-          f"{len(task_names)} tasks × {num_episodes} ep")
+    print(f"\n[eval] {suite} × {perturbation} (suite={perturbed_suite}) | "
+          f"{len(task_names)} tasks × {num_episodes} ep | max_steps={max_steps}")
 
     results = load_progress(progress_path) if resume else {}
     policy.eval()
@@ -224,7 +329,7 @@ def run_perturbation(
     for task_idx, task_name in enumerate(task_names):
         if task_name in results:
             sr = results[task_name]["success_rate"]
-            print(f"  [{task_idx+1:3d}/{len(task_names)}] SKIP {task_name[:50]} "
+            print(f"  [{task_idx+1:2d}/{len(task_names)}] SKIP {task_name[:55]} "
                   f"(SR={sr*100:.0f}%)")
             continue
 
@@ -232,21 +337,19 @@ def run_perturbation(
         task_description = task.language
         lang_tokens      = tokenize_task(task_description, tokenizer, config, device)
 
-        env_args = {
-            "bddl_file_name": task.bddl_file,
-            "camera_heights": 128,
-            "camera_widths":  128,
-            **perturbation_flags,
-        }
-
+        # Instantiate env WITHOUT perturbation flags — already baked into bddl/init files
         try:
-            env = OffScreenRenderEnv(**env_args)
+            env = OffScreenRenderEnv(
+                bddl_file_name=task.bddl_file,
+                camera_heights=128,
+                camera_widths=128,
+            )
             env.seed(seed)
         except Exception as e:
-            print(f"  [{task_idx+1:3d}] ENV ERROR {task_name[:50]}: {e}")
+            print(f"  [{task_idx+1:2d}] ENV ERROR {task_name[:55]}: {e}")
             results[task_name] = {
                 "success_rate": 0.0, "successes": 0,
-                "episodes": 0, "error": str(e)
+                "episodes": 0, "error": str(e),
             }
             save_progress(progress_path, results)
             continue
@@ -255,8 +358,10 @@ def run_perturbation(
         t_task    = time.time()
 
         for ep in range(num_episodes):
+            if hasattr(policy, "reset"):
+                policy.reset()
             try:
-                success = run_episode(policy, env, lang_tokens, device, config)
+                success = run_episode(policy, env, lang_tokens, device, config, max_steps)
                 successes.append(float(success))
             except Exception as e:
                 print(f"    ep {ep} ERROR: {e}")
@@ -273,28 +378,26 @@ def run_perturbation(
             "episodes":     num_episodes,
             "elapsed_s":    round(elapsed_s, 1),
         }
-
-        # Save after every task
         save_progress(progress_path, results)
 
         print(
-            f"  [{task_idx+1:3d}/{len(task_names)}] {task_name[:50]:<50} "
+            f"  [{task_idx+1:2d}/{len(task_names)}] {task_name[:55]:<55} "
             f"SR: {sr*100:5.1f}%  ({int(np.sum(successes))}/{num_episodes})  "
             f"{elapsed_s:.0f}s"
         )
 
-    # Overall
     task_results = {k: v for k, v in results.items() if not k.startswith("__")}
     overall_sr   = float(np.mean([v["success_rate"] for v in task_results.values()]))
     results["__overall__"] = {
-        "label":             label,
+        "suite":             suite,
         "perturbation":      perturbation,
+        "perturbed_suite":   perturbed_suite,
         "success_rate":      overall_sr,
         "num_tasks":         len(task_results),
         "episodes_per_task": num_episodes,
     }
     save_progress(progress_path, results)
-    print(f"\n  >> {label} | {perturbation} overall SR: {overall_sr*100:.2f}%\n")
+    print(f"\n  >> {suite} × {perturbation}  SR: {overall_sr*100:.2f}%\n")
     return results
 
 
@@ -302,11 +405,19 @@ def run_perturbation(
 
 def dry_run(policy, config, device):
     print("\n[dry-run] Sanity forward pass ...")
-    B         = 1
-    T_img     = 1
-    T_lang    = config.tokenizer_max_length
-    chunk     = config.chunk_size
-    state_dim = list(config.input_features.values())[0].shape[0]
+    B      = 1
+    T_img  = 1
+    T_lang = config.tokenizer_max_length
+    chunk  = config.chunk_size
+
+    state_feature = next(
+        (v for k, v in config.input_features.items() if "state" in k.lower()), None
+    )
+    if state_feature is None:
+        raise RuntimeError(
+            "[dry-run] Could not find state feature in config.input_features"
+        )
+    state_dim = state_feature.shape[0]
 
     with torch.no_grad():
         loss = policy.model(
@@ -334,142 +445,139 @@ def dry_run(policy, config, device):
 
 def parse_args():
     p = argparse.ArgumentParser(
-        description="Full LIBERO-PRO eval — MLA checkpoint vs vanilla pi0 baseline"
+        description="Full LIBERO-PRO benchmark eval — MLA checkpoint "
+                    "(4 suites × 5 perturbations)"
     )
     p.add_argument("--checkpoint", type=str, required=True,
-                   help="Path to MLA checkpoint model.pt (55 tensors)")
+                   help="Path to MLA checkpoint model.pt")
+    p.add_argument("--suites", nargs="+", default=ALL_SUITES,
+                   choices=ALL_SUITES,
+                   help="Task suites to eval (default: all 4)")
     p.add_argument("--perturbations", nargs="+", default=ALL_PERTURBATIONS,
                    choices=ALL_PERTURBATIONS,
-                   help="Perturbation types to eval (default: all 4)")
+                   help="Perturbation types to eval (default: all 5)")
     p.add_argument("--num_episodes", type=int, default=NUM_EPISODES,
                    help=f"Episodes per task (default: {NUM_EPISODES})")
     p.add_argument("--device",     type=str, default="cuda")
     p.add_argument("--seed",       type=int, default=42)
     p.add_argument("--output_dir", type=str, default=None,
                    help="Where to save results (default: next to checkpoint)")
+    p.add_argument("--bddl_base",  type=str,
+                   default="./LIBERO-PRO/libero/libero/bddl_files",
+                   help="Path to LIBERO-PRO bddl_files directory")
+    p.add_argument("--init_base",  type=str,
+                   default="./LIBERO-PRO/libero/libero/init_files",
+                   help="Path to LIBERO-PRO init_files directory")
     p.add_argument("--resume", action="store_true",
-                   help="Resume — skip already-completed tasks")
+                   help="Skip already-completed tasks")
     p.add_argument("--dry_run", action="store_true",
                    help="One forward pass to verify everything works, then exit")
-    p.add_argument("--skip_baseline", action="store_true",
-                   help="Skip baseline eval (use if baseline already done)")
     return p.parse_args()
 
 
 def main():
     args = parse_args()
 
-    output_dir = args.output_dir or str(Path(args.checkpoint).parent / "libero_pro_eval")
+    output_dir = args.output_dir or str(
+        Path(args.checkpoint).parent / "libero_pro_eval"
+    )
     os.makedirs(output_dir, exist_ok=True)
     print(f"[setup] Output dir: {output_dir}")
 
-    tokenizer = make_tokenizer()
-    all_results = {}
-    t_total = time.time()
+    combos = [
+        (suite, pert)
+        for suite in args.suites
+        for pert  in args.perturbations
+    ]
+    print(f"[setup] {len(combos)} suite×perturbation combinations | "
+          f"{len(combos) * 10 * args.num_episodes} total rollouts")
 
-    # ── Dry run ──────────────────────────────────────────────────────────────
-    if args.dry_run:
-        print("\n=== DRY RUN: MLA checkpoint ===")
-        policy, config = build_model(args.device)
-        load_mla_checkpoint(policy, args.checkpoint, args.device)
-        dry_run(policy, config, args.device)
-        del policy
-        torch.cuda.empty_cache()
-
-        print("=== DRY RUN: baseline ===")
-        policy, config = build_model(args.device)
-        dry_run(policy, config, args.device)
-        del policy
-        torch.cuda.empty_cache()
-        print("[dry-run] Both models OK. Ready for full eval.")
-        return
-
-    # ── Baseline eval ─────────────────────────────────────────────────────────
-    if not args.skip_baseline:
-        print("\n" + "="*60)
-        print("PHASE 1: BASELINE (vanilla pi0, no finetuning)")
-        print("="*60)
-        policy, config = build_model(args.device)
-        # No checkpoint loaded — pure pretrained pi0
-
-        baseline_results = {}
-        for perturbation in args.perturbations:
-            progress_path = os.path.join(
-                output_dir, f"baseline_{perturbation}.json"
-            )
-            result = run_perturbation(
-                policy        = policy,
-                config        = config,
-                tokenizer     = tokenizer,
-                perturbation  = perturbation,
-                num_episodes  = args.num_episodes,
-                device        = args.device,
-                seed          = args.seed,
-                progress_path = progress_path,
-                resume        = args.resume,
-                label         = "baseline",
-            )
-            baseline_results[perturbation] = result
-
-        all_results["baseline"] = baseline_results
-        del policy
-        torch.cuda.empty_cache()
-        gc.collect()
-
-    # ── MLA checkpoint eval ───────────────────────────────────────────────────
-    print("\n" + "="*60)
-    print("PHASE 2: MLA CHECKPOINT")
-    print("="*60)
+    tokenizer      = make_tokenizer()
     policy, config = build_model(args.device)
     load_mla_checkpoint(policy, args.checkpoint, args.device)
 
-    mla_results = {}
-    for perturbation in args.perturbations:
-        progress_path = os.path.join(
-            output_dir, f"mla_{perturbation}.json"
-        )
-        result = run_perturbation(
+    if args.dry_run:
+        dry_run(policy, config, args.device)
+        return
+
+    all_results = {}
+    t_total     = time.time()
+
+    for suite, perturbation in combos:
+        key           = f"{suite}__{perturbation}"
+        progress_path = os.path.join(output_dir, f"{key}.json")
+
+        result = run_combo(
             policy        = policy,
             config        = config,
             tokenizer     = tokenizer,
+            suite         = suite,
             perturbation  = perturbation,
             num_episodes  = args.num_episodes,
             device        = args.device,
             seed          = args.seed,
             progress_path = progress_path,
             resume        = args.resume,
-            label         = "mla",
+            bddl_base     = args.bddl_base,
+            init_base     = args.init_base,
         )
-        mla_results[perturbation] = result
-
-    all_results["mla"] = mla_results
-    del policy
-    torch.cuda.empty_cache()
+        all_results[key] = result
 
     # ── Final summary ─────────────────────────────────────────────────────────
     elapsed = time.time() - t_total
-    print("\n" + "="*60)
-    print(f"LIBERO-PRO RESULTS  ({args.num_episodes} episodes/task)")
-    print("="*60)
-    print(f"  {'Perturbation':<14} {'Baseline SR':>12} {'MLA SR':>10} {'Delta':>8}")
-    print(f"  {'-'*14} {'-'*12} {'-'*10} {'-'*8}")
 
+    # Per-suite average across perturbations
+    suite_avgs = {}
+    for suite in args.suites:
+        srs = [
+            all_results[f"{suite}__{p}"]["__overall__"]["success_rate"]
+            for p in args.perturbations
+            if f"{suite}__{p}" in all_results
+        ]
+        suite_avgs[suite] = float(np.mean(srs)) if srs else float("nan")
+
+    # Per-perturbation average across suites
+    pert_avgs = {}
     for pert in args.perturbations:
-        mla_sr  = mla_results[pert]["__overall__"]["success_rate"] * 100
-        base_sr = (
-            all_results.get("baseline", {})
-            .get(pert, {})
-            .get("__overall__", {})
-            .get("success_rate", float("nan"))
-        ) * 100
-        delta = mla_sr - base_sr
-        sign  = "+" if delta >= 0 else ""
-        print(f"  {pert:<14} {base_sr:>11.1f}%  {mla_sr:>9.1f}%  {sign}{delta:>6.1f}%")
+        srs = [
+            all_results[f"{s}__{pert}"]["__overall__"]["success_rate"]
+            for s in args.suites
+            if f"{s}__{pert}" in all_results
+        ]
+        pert_avgs[pert] = float(np.mean(srs)) if srs else float("nan")
 
-    print("="*60)
+    overall = float(np.mean(list(suite_avgs.values())))
+
+    col_w = 12
+    header = f"  {'Suite':<16}" + "".join(f"{p:>{col_w}}" for p in args.perturbations) + f"{'Avg':>{col_w}}"
+
+    print("\n" + "=" * len(header))
+    print(f"LIBERO-PRO RESULTS  ({args.num_episodes} episodes/task)")
+    print("=" * len(header))
+    print(header)
+    print("  " + "-" * (len(header) - 2))
+
+    for suite in args.suites:
+        row = f"  {suite:<16}"
+        for pert in args.perturbations:
+            key = f"{suite}__{pert}"
+            sr  = all_results.get(key, {}).get("__overall__", {}).get(
+                "success_rate", float("nan")
+            ) * 100
+            row += f"{sr:>{col_w}.1f}%"[:-1].rjust(col_w)  # strip extra % then pad
+            row += "%"
+        row += f"{suite_avgs[suite]*100:>{col_w}.1f}%"[:-1].rjust(col_w) + "%"
+        print(row)
+
+    print("  " + "-" * (len(header) - 2))
+    avg_row = f"  {'Avg':<16}"
+    for pert in args.perturbations:
+        avg_row += f"{pert_avgs[pert]*100:>{col_w-1}.1f}%".rjust(col_w)
+    avg_row += f"{overall*100:>{col_w-1}.1f}%".rjust(col_w)
+    print(avg_row)
+    print("=" * len(header))
     print(f"Total time: {elapsed/3600:.1f} hours")
 
-    # Save full results
     final_json = os.path.join(output_dir, "eval_results_final.json")
     with open(final_json, "w") as f:
         json.dump(all_results, f, indent=2)
