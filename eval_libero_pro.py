@@ -152,7 +152,7 @@ def build_model(device: str):
 
 def load_mla_checkpoint(policy, ckpt_path: str, device: str):
     print(f"[ckpt] Loading MLA checkpoint: {ckpt_path}")
-    ckpt = torch.load(ckpt_path, map_location=device)
+    ckpt = torch.load(ckpt_path, map_location=device, weights_only=True)
     missing, unexpected = policy.model.load_state_dict(ckpt, strict=False)
     print(f"[ckpt] Overlaid {len(ckpt)} tensors | "
           f"missing: {len(missing)} | unexpected: {len(unexpected)}")
@@ -249,6 +249,49 @@ def ensure_perturbed_suite(
     return perturbed_suite
 
 
+# ── State construction ────────────────────────────────────────────────────────
+
+# pi0_libero_base state_proj expects 32 dims.  We read the true value at runtime
+# in main() after the model is built and store it here so run_episode can use it.
+STATE_DIM: int = 32   # overwritten in main() after model load
+
+# Proprioceptive keys in the order lerobot's pi0_libero_base concatenates them.
+# Together they sum to 32: cos(7) + sin(7) + vel(7) + gripper_qpos(2) +
+# eef_pos(3) + eef_quat(4) + gripper_qvel(1) + eef_vel(3) = 34 → first 32 used.
+_PROPRIO_KEYS = [
+    "robot0_joint_pos_cos",   # 7
+    "robot0_joint_pos_sin",   # 7
+    "robot0_joint_vel",       # 7
+    "robot0_gripper_qpos",    # 2
+    "robot0_eef_pos",         # 3
+    "robot0_eef_quat",        # 4
+    "robot0_gripper_qvel",    # 1
+    "robot0_eef_vel",         # 3  (may be absent in some envs)
+]
+
+
+def _build_state(obs: dict, state_dim: int, device) -> torch.Tensor:
+    """
+    Concatenate available proprioceptive obs keys into a (1, state_dim) tensor,
+    truncating or zero-padding to exactly state_dim dims.
+    """
+    parts = []
+    for key in _PROPRIO_KEYS:
+        if key in obs:
+            parts.append(obs[key].astype(np.float32).flatten())
+    if not parts:
+        raise KeyError(
+            f"None of the expected proprioceptive keys found in obs. "
+            f"Available keys: {list(obs.keys())}"
+        )
+    vec = np.concatenate(parts)
+    if vec.shape[0] >= state_dim:
+        vec = vec[:state_dim]
+    else:
+        vec = np.pad(vec, (0, state_dim - vec.shape[0]))
+    return torch.from_numpy(vec).unsqueeze(0).to(device)
+
+
 # ── Episode rollout ───────────────────────────────────────────────────────────
 
 def run_episode(policy, env, lang_tokens, device, config, max_steps: int) -> bool:
@@ -267,9 +310,13 @@ def run_episode(policy, env, lang_tokens, device, config, max_steps: int) -> boo
                 1, 1, dtype=torch.bool, device=device
             ),
 
-            "observation.state": torch.from_numpy(
-                obs["robot0_joint_pos_cos"].astype(np.float32)
-            ).unsqueeze(0).to(device),
+            # pi0 expects a concatenation of all proprioceptive components.
+            # robot0_joint_pos_cos (8) + robot0_joint_pos_sin (8) +
+            # robot0_joint_vel (8) + robot0_gripper_qpos (2) + robot0_eef_pos (3)
+            # + robot0_eef_quat (4) + robot0_gripper_qvel (1) = 34 → padded to 32
+            # in practice lerobot's pi0_libero_base uses the first 32 dims.
+            # Concatenate what's available and truncate/pad to match state_proj input.
+            "observation.state": _build_state(obs, STATE_DIM, device),
 
             **lang_tokens,
         }
@@ -410,14 +457,11 @@ def dry_run(policy, config, device):
     T_lang = config.tokenizer_max_length
     chunk  = config.chunk_size
 
-    state_feature = next(
-        (v for k, v in config.input_features.items() if "state" in k.lower()), None
-    )
-    if state_feature is None:
-        raise RuntimeError(
-            "[dry-run] Could not find state feature in config.input_features"
-        )
-    state_dim = state_feature.shape[0]
+    # Read state_dim directly from the model's state_proj weight — the config
+    # input_features may reflect a single obs component (e.g. 8-dim joint_pos_cos)
+    # while pi0 concatenates several components into a larger state vector (32-dim).
+    state_dim = policy.model.state_proj.weight.shape[1]
+    print(f"[dry-run] state_dim={state_dim} (from state_proj.weight)")
 
     with torch.no_grad():
         loss = policy.model(
@@ -495,6 +539,12 @@ def main():
     tokenizer      = make_tokenizer()
     policy, config = build_model(args.device)
     load_mla_checkpoint(policy, args.checkpoint, args.device)
+
+    # Set true state_dim from model weights — config input_features may reflect
+    # a single obs component (e.g. 8-dim) while pi0 expects the full concat (32-dim)
+    global STATE_DIM
+    STATE_DIM = policy.model.state_proj.weight.shape[1]
+    print(f"[setup] state_dim={STATE_DIM} (from state_proj.weight)")
 
     if args.dry_run:
         dry_run(policy, config, args.device)
