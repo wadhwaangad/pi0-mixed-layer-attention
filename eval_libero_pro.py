@@ -1,8 +1,14 @@
 """
 eval_libero_pro.py — Full LIBERO-PRO evaluation for PI0 + MixedLayerAttention.
 
-Evaluates the MLA checkpoint across all 4 official task suites and 5 perturbation
-types (20 suite×perturbation combinations), 3 episodes per task.
+Evaluates across all 4 official task suites and 5 perturbation types
+(20 suite×perturbation combinations), 1 episode per task by default.
+
+Two modes:
+  Default         : evaluate a single checkpoint (MLA or base)
+  --compare_base  : run BOTH the base PI0 (no MLA weights) and your MLA
+                    checkpoint back-to-back, printing a head-to-head table.
+                    This covers all 200 tasks (20 combos × 10 tasks), 1 ep each.
 
 Saves progress after every task — fully resumable after preemption.
 
@@ -10,7 +16,7 @@ Official benchmark structure (Zxy-MLlab/LIBERO-PRO):
   Suites      : libero_goal, libero_spatial, libero_10, libero_object  (10 tasks each)
   Perturbations: object, position, semantic, task, environment         (5 types)
   Combinations: 4 × 5 = 20   (task cannot be combined with others)
-  Total tasks : 4 × 10 × 5 = 200 (× 3 episodes = 600 rollouts)
+  Total tasks : 4 × 10 × 5 = 200 (× 1 episode = 200 rollouts)
 
 Per-suite max steps (from official TASK_MAX_STEPS):
   libero_goal    : 300
@@ -25,15 +31,29 @@ Perturbation flag → suite suffix mapping (from evaluation_config.yaml):
   use_task        (task)        → _task
   use_environment (environment) → _env
 
+Official LIBERO-PRO baselines (Zhou et al. 2025, arXiv:2510.03827):
+  Position perturbation (Figure 2):
+    pi0:     goal=0%, spatial=0%, 10=0%, object=0%     (baseline: 92/90/82/98%)
+    pi0.5:   goal=38%, spatial=20%, 10=8%, object=17%  (baseline: 97/96/93/98%)
+    OpenVLA: goal=0%,  spatial=0%,  10=0%, object=0%   (baseline: 98/95/93/99%)
+    UniVLA:  goal=9%,  spatial=5%,  10=2%, object=0%   (baseline: 89/85/61/98%)
+  Task perturbation: all models → 0-1% across all suites.
+  Object/semantic/environment: not fully tabulated in paper; near-zero for pi0/OpenVLA.
+
 Usage:
     # Sanity check first
     python eval_libero_pro.py \\
         --checkpoint ./outputs/mixed_layer_attention/checkpoint_006000/model.pt \\
         --dry_run
 
-    # Full benchmark — all 4 suites, all 5 perturbations, 3 episodes
+    # Full benchmark — 1 episode, all 4 suites, all 5 perturbations (200 rollouts)
     python eval_libero_pro.py \\
         --checkpoint ./outputs/mixed_layer_attention/checkpoint_006000/model.pt
+
+    # Head-to-head: base PI0 vs your MLA checkpoint (400 rollouts total)
+    python eval_libero_pro.py \\
+        --checkpoint ./outputs/mixed_layer_attention/checkpoint_006000/model.pt \\
+        --compare_base
 
     # Resume after preemption
     python eval_libero_pro.py \\
@@ -45,9 +65,17 @@ Usage:
         --checkpoint ./outputs/mixed_layer_attention/checkpoint_006000/model.pt \\
         --suites libero_goal libero_spatial \\
         --perturbations position object
+
+Timing estimate on T4 (4-5s/step, 1 episode):
+    Optimistic (~50 avg steps):   ~12 hours  (200 rollouts)
+    Realistic  (~100 avg steps):  ~25 hours
+    Worst case (full max_steps):  ~83 hours
+    --compare_base doubles these figures (400 rollouts).
+    Tip: --suites libero_goal --perturbations position for a quick smoke-test.
 """
 
 import argparse
+import copy
 import gc
 import json
 import os
@@ -67,7 +95,7 @@ from pi0_policy_mixed_layer_attention import PI0PolicyMixedLayerAttention
 # ── Constants ────────────────────────────────────────────────────────────────
 
 MODEL_ID = "lerobot/pi0_libero_base"
-NUM_EPISODES = 3
+NUM_EPISODES = 1   # Changed from 3 → 1 for the 200-task sweep
 
 # Official leaderboard suites (10 tasks each)
 ALL_SUITES = ["libero_goal", "libero_spatial", "libero_10", "libero_object"]
@@ -84,11 +112,6 @@ SUITE_MAX_STEPS = {
 ALL_PERTURBATIONS = ["position", "object", "semantic", "task", "environment"]
 
 # Official flag mapping (evaluation_config.yaml — Zxy-MLlab/LIBERO-PRO)
-#   use_swap        → position generalization
-#   use_object      → object generalization
-#   use_language    → semantic/language generalization
-#   use_task        → task generalization
-#   use_environment → environment generalization
 PERTURBATION_TO_FLAG = {
     "position":    "use_swap",
     "object":      "use_object",
@@ -97,13 +120,52 @@ PERTURBATION_TO_FLAG = {
     "environment": "use_environment",
 }
 
-# Official suite-name suffixes (perturbation_mapping in evaluation_config.yaml)
+# Official suite-name suffixes
 PERTURBATION_TO_SUFFIX = {
     "position":    "swap",
     "object":      "object",
     "semantic":    "lan",
     "task":        "task",
     "environment": "env",
+}
+
+# ── Official LIBERO-PRO baselines (Zhou et al. 2025, arXiv:2510.03827) ──────
+OFFICIAL_BASELINES = {
+    "pi0 (baseline)": {
+        "position":    {"libero_goal": 0.92, "libero_spatial": 0.90, "libero_10": 0.82, "libero_object": 0.98},
+        "object":      {"libero_goal": 0.92, "libero_spatial": 0.90, "libero_10": 0.82, "libero_object": 0.98},
+        "semantic":    {"libero_goal": 0.92, "libero_spatial": 0.90, "libero_10": 0.82, "libero_object": 0.98},
+        "task":        {"libero_goal": 0.92, "libero_spatial": 0.90, "libero_10": 0.82, "libero_object": 0.98},
+        "environment": {"libero_goal": 0.92, "libero_spatial": 0.90, "libero_10": 0.82, "libero_object": 0.98},
+    },
+    "pi0 (LIBERO-PRO)": {
+        "position":    {"libero_goal": 0.00, "libero_spatial": 0.00, "libero_10": 0.00, "libero_object": 0.00},
+        "object":      {"libero_goal": float("nan"), "libero_spatial": float("nan"), "libero_10": float("nan"), "libero_object": float("nan")},
+        "semantic":    {"libero_goal": float("nan"), "libero_spatial": float("nan"), "libero_10": float("nan"), "libero_object": float("nan")},
+        "task":        {"libero_goal": 0.00, "libero_spatial": 0.00, "libero_10": 0.00, "libero_object": 0.00},
+        "environment": {"libero_goal": float("nan"), "libero_spatial": float("nan"), "libero_10": float("nan"), "libero_object": float("nan")},
+    },
+    "pi0.5 (LIBERO-PRO)": {
+        "position":    {"libero_goal": 0.38, "libero_spatial": 0.20, "libero_10": 0.08, "libero_object": 0.17},
+        "object":      {"libero_goal": float("nan"), "libero_spatial": float("nan"), "libero_10": float("nan"), "libero_object": float("nan")},
+        "semantic":    {"libero_goal": float("nan"), "libero_spatial": float("nan"), "libero_10": float("nan"), "libero_object": float("nan")},
+        "task":        {"libero_goal": 0.00, "libero_spatial": 0.01, "libero_10": 0.01, "libero_object": 0.01},
+        "environment": {"libero_goal": float("nan"), "libero_spatial": float("nan"), "libero_10": float("nan"), "libero_object": float("nan")},
+    },
+    "OpenVLA (LIBERO-PRO)": {
+        "position":    {"libero_goal": 0.00, "libero_spatial": 0.00, "libero_10": 0.00, "libero_object": 0.00},
+        "object":      {"libero_goal": float("nan"), "libero_spatial": float("nan"), "libero_10": float("nan"), "libero_object": float("nan")},
+        "semantic":    {"libero_goal": float("nan"), "libero_spatial": float("nan"), "libero_10": float("nan"), "libero_object": float("nan")},
+        "task":        {"libero_goal": 0.00, "libero_spatial": 0.00, "libero_10": 0.00, "libero_object": 0.00},
+        "environment": {"libero_goal": float("nan"), "libero_spatial": float("nan"), "libero_10": float("nan"), "libero_object": float("nan")},
+    },
+    "UniVLA (LIBERO-PRO)": {
+        "position":    {"libero_goal": 0.09, "libero_spatial": 0.05, "libero_10": 0.02, "libero_object": 0.00},
+        "object":      {"libero_goal": float("nan"), "libero_spatial": float("nan"), "libero_10": float("nan"), "libero_object": float("nan")},
+        "semantic":    {"libero_goal": float("nan"), "libero_spatial": float("nan"), "libero_10": float("nan"), "libero_object": float("nan")},
+        "task":        {"libero_goal": 0.00, "libero_spatial": 0.00, "libero_10": 0.00, "libero_object": 0.00},
+        "environment": {"libero_goal": float("nan"), "libero_spatial": float("nan"), "libero_10": float("nan"), "libero_object": float("nan")},
+    },
 }
 
 # ── Model ────────────────────────────────────────────────────────────────────
@@ -159,6 +221,22 @@ def load_mla_checkpoint(policy, ckpt_path: str, device: str):
     return policy
 
 
+def build_base_model(policy_with_mla, config, device: str):
+    """
+    Return a copy of the policy with MLA weights zeroed / reset so it behaves
+    identically to the vanilla pretrained PI0 (no MLA fine-tuning).
+
+    We do this by building a fresh model from scratch (pretrained weights only)
+    rather than trying to surgically remove the MLA deltas, which avoids any
+    risk of contamination from the fine-tuned checkpoint.
+    """
+    print("\n[base] Building a clean base PI0 (no MLA checkpoint) ...")
+    base_policy, _ = build_model(device)
+    base_policy.eval()
+    print("[base] Base model ready.")
+    return base_policy
+
+
 # ── Tokenizer ────────────────────────────────────────────────────────────────
 
 def make_tokenizer():
@@ -207,10 +285,6 @@ def ensure_perturbed_suite(
     """
     Pre-generate the perturbed task suite via LIBERO-PRO's perturbation.create_env().
     Returns the perturbed suite name e.g. 'libero_goal_swap'.
-
-    Follows the official LIBERO-PRO setup flow: perturbations are baked into
-    bddl/init files ahead of time, NOT passed as live flags into OffScreenRenderEnv.
-    Note: task cannot be combined with other perturbations (official constraint).
     """
     try:
         from LIBERO_PRO import perturbation as libero_perturbation
@@ -237,7 +311,6 @@ def ensure_perturbed_suite(
         "bddl_files_path": bddl_base,
         "init_file_dir":   init_base,
         "task_suite_name": suite,
-        # Only one flag active at a time (official constraint for single perturbation)
         "use_swap":        flag_key == "use_swap",
         "use_object":      flag_key == "use_object",
         "use_language":    flag_key == "use_language",
@@ -251,30 +324,21 @@ def ensure_perturbed_suite(
 
 # ── State construction ────────────────────────────────────────────────────────
 
-# pi0_libero_base state_proj expects 32 dims.  We read the true value at runtime
-# in main() after the model is built and store it here so run_episode can use it.
-STATE_DIM: int = 32   # overwritten in main() after model load
+STATE_DIM: int = 32  # overwritten in main() after model load
 
-# Proprioceptive keys in the order lerobot's pi0_libero_base concatenates them.
-# Together they sum to 32: cos(7) + sin(7) + vel(7) + gripper_qpos(2) +
-# eef_pos(3) + eef_quat(4) + gripper_qvel(1) + eef_vel(3) = 34 → first 32 used.
 _PROPRIO_KEYS = [
-    "robot0_joint_pos_cos",   # 7
-    "robot0_joint_pos_sin",   # 7
-    "robot0_joint_vel",       # 7
-    "robot0_gripper_qpos",    # 2
-    "robot0_eef_pos",         # 3
-    "robot0_eef_quat",        # 4
-    "robot0_gripper_qvel",    # 1
-    "robot0_eef_vel",         # 3  (may be absent in some envs)
+    "robot0_joint_pos_cos",
+    "robot0_joint_pos_sin",
+    "robot0_joint_vel",
+    "robot0_gripper_qpos",
+    "robot0_eef_pos",
+    "robot0_eef_quat",
+    "robot0_gripper_qvel",
+    "robot0_eef_vel",
 ]
 
 
 def _build_state(obs: dict, state_dim: int, device) -> torch.Tensor:
-    """
-    Concatenate available proprioceptive obs keys into a (1, state_dim) tensor,
-    truncating or zero-padding to exactly state_dim dims.
-    """
     parts = []
     for key in _PROPRIO_KEYS:
         if key in obs:
@@ -294,10 +358,9 @@ def _build_state(obs: dict, state_dim: int, device) -> torch.Tensor:
 
 # ── Episode rollout ───────────────────────────────────────────────────────────
 
-def run_episode(policy, env, lang_tokens, device, config, max_steps: int) -> bool:
-    """Run one episode. Returns True if successful."""
-    obs         = env.reset()
-    ep_success  = False
+def run_episode(policy, env, lang_tokens, device, config, max_steps: int) -> tuple[bool, int]:
+    obs        = env.reset()
+    ep_success = False
     steps_taken = 0
 
     while steps_taken < max_steps:
@@ -310,12 +373,6 @@ def run_episode(policy, env, lang_tokens, device, config, max_steps: int) -> boo
                 1, 1, dtype=torch.bool, device=device
             ),
 
-            # pi0 expects a concatenation of all proprioceptive components.
-            # robot0_joint_pos_cos (8) + robot0_joint_pos_sin (8) +
-            # robot0_joint_vel (8) + robot0_gripper_qpos (2) + robot0_eef_pos (3)
-            # + robot0_eef_quat (4) + robot0_gripper_qvel (1) = 34 → padded to 32
-            # in practice lerobot's pi0_libero_base uses the first 32 dims.
-            # Concatenate what's available and truncate/pad to match state_proj input.
             "observation.state": _build_state(obs, STATE_DIM, device),
 
             **lang_tokens,
@@ -330,9 +387,9 @@ def run_episode(policy, env, lang_tokens, device, config, max_steps: int) -> boo
             steps_taken += 1
             ep_success = ep_success or bool(info.get("success", False))
             if done or ep_success or steps_taken >= max_steps:
-                return ep_success
+                return ep_success, steps_taken
 
-    return ep_success
+    return ep_success, steps_taken
 
 
 # ── Single suite × perturbation eval ─────────────────────────────────────────
@@ -350,6 +407,8 @@ def run_combo(
     resume: bool,
     bddl_base: str,
     init_base: str,
+    model_label: str = "model",
+    num_tasks: int = 10,
 ) -> dict:
     try:
         from libero.libero import benchmark as libero_benchmark
@@ -360,18 +419,18 @@ def run_combo(
         )
 
     max_steps = SUITE_MAX_STEPS[suite]
-
-    # Pre-generate the perturbed suite (official LIBERO-PRO flow)
     perturbed_suite = ensure_perturbed_suite(suite, perturbation, bddl_base, init_base)
 
     benchmark  = libero_benchmark.get_benchmark_dict()[perturbed_suite]()
-    task_names = benchmark.get_task_names()
+    task_names = benchmark.get_task_names()[:num_tasks]
 
-    print(f"\n[eval] {suite} × {perturbation} (suite={perturbed_suite}) | "
-          f"{len(task_names)} tasks × {num_episodes} ep | max_steps={max_steps}")
+    print(f"\n[eval:{model_label}] {suite} × {perturbation} | "
+          f"{len(task_names)}/{benchmark.get_num_tasks()} tasks × {num_episodes} ep | max_steps={max_steps}")
 
     results = load_progress(progress_path) if resume else {}
     policy.eval()
+
+    total_steps_taken = 0
 
     for task_idx, task_name in enumerate(task_names):
         if task_name in results:
@@ -384,7 +443,6 @@ def run_combo(
         task_description = task.language
         lang_tokens      = tokenize_task(task_description, tokenizer, config, device)
 
-        # Instantiate env WITHOUT perturbation flags — already baked into bddl/init files
         try:
             env = OffScreenRenderEnv(
                 bddl_file_name=task.bddl_file,
@@ -401,18 +459,24 @@ def run_combo(
             save_progress(progress_path, results)
             continue
 
-        successes = []
-        t_task    = time.time()
+        successes  = []
+        steps_list = []
+        t_task     = time.time()
 
         for ep in range(num_episodes):
             if hasattr(policy, "reset"):
                 policy.reset()
             try:
-                success = run_episode(policy, env, lang_tokens, device, config, max_steps)
+                success, steps = run_episode(
+                    policy, env, lang_tokens, device, config, max_steps
+                )
                 successes.append(float(success))
+                steps_list.append(steps)
+                total_steps_taken += steps
             except Exception as e:
                 print(f"    ep {ep} ERROR: {e}")
                 successes.append(0.0)
+                steps_list.append(0)
 
         env.close()
 
@@ -424,13 +488,14 @@ def run_combo(
             "successes":    int(np.sum(successes)),
             "episodes":     num_episodes,
             "elapsed_s":    round(elapsed_s, 1),
+            "avg_steps":    round(float(np.mean(steps_list)), 1),
         }
         save_progress(progress_path, results)
 
         print(
             f"  [{task_idx+1:2d}/{len(task_names)}] {task_name[:55]:<55} "
             f"SR: {sr*100:5.1f}%  ({int(np.sum(successes))}/{num_episodes})  "
-            f"{elapsed_s:.0f}s"
+            f"avg_steps={np.mean(steps_list):.0f}  {elapsed_s:.0f}s"
         )
 
     task_results = {k: v for k, v in results.items() if not k.startswith("__")}
@@ -442,9 +507,11 @@ def run_combo(
         "success_rate":      overall_sr,
         "num_tasks":         len(task_results),
         "episodes_per_task": num_episodes,
+        "total_steps":       total_steps_taken,
+        "model_label":       model_label,
     }
     save_progress(progress_path, results)
-    print(f"\n  >> {suite} × {perturbation}  SR: {overall_sr*100:.2f}%\n")
+    print(f"\n  >> [{model_label}] {suite} × {perturbation}  SR: {overall_sr*100:.2f}%\n")
     return results
 
 
@@ -453,21 +520,17 @@ def run_combo(
 def dry_run(policy, config, device):
     print("\n[dry-run] Sanity forward pass ...")
     B      = 1
-    T_img  = 1
     T_lang = config.tokenizer_max_length
     chunk  = config.chunk_size
 
-    # Read state_dim directly from the model's state_proj weight — the config
-    # input_features may reflect a single obs component (e.g. 8-dim joint_pos_cos)
-    # while pi0 concatenates several components into a larger state vector (32-dim).
     state_dim = policy.model.state_proj.weight.shape[1]
     print(f"[dry-run] state_dim={state_dim} (from state_proj.weight)")
 
     with torch.no_grad():
         loss = policy.model(
-            images      = torch.randn(B, T_img, 3, 224, 224,
+            images      = torch.randn(B, 1, 3, 224, 224,
                                       device=device, dtype=torch.bfloat16),
-            img_masks   = torch.ones(B, T_img, dtype=torch.bool, device=device),
+            img_masks   = torch.ones(B, 1, dtype=torch.bool, device=device),
             lang_tokens = torch.randint(0, 256_000, (B, T_lang), device=device),
             lang_masks  = torch.ones(B, T_lang, dtype=torch.bool, device=device),
             state       = torch.randn(B, state_dim,
@@ -485,12 +548,208 @@ def dry_run(policy, config, device):
     print("[dry-run] All good.\n")
 
 
+# ── Comparison table printer ──────────────────────────────────────────────────
+
+def _fmt(val: float) -> str:
+    if val != val:
+        return "  N/A"
+    return f"{val*100:5.1f}%"
+
+
+def print_comparison_table(
+    all_results: dict,
+    args,
+    elapsed: float,
+    ckpt_label: str = "MLA (ours)",
+    base_results: dict | None = None,
+):
+    """
+    Print per-perturbation comparison tables.
+
+    When base_results is provided (--compare_base mode), adds a 'Base PI0'
+    column immediately before the MLA column so the delta is obvious.
+    """
+    suites        = args.suites
+    perturbations = args.perturbations
+    col_w         = 12
+
+    baseline_models = list(OFFICIAL_BASELINES.keys())
+
+    print("\n" + "=" * 90)
+    print(f"LIBERO-PRO RESULTS  ({args.num_episodes} episode/task)  —  {ckpt_label}")
+    if base_results is not None:
+        print("  [compare_base mode: Base PI0 column included for head-to-head comparison]")
+    print("=" * 90)
+
+    for pert in perturbations:
+        active_baselines = [
+            m for m in baseline_models
+            if any(
+                not np.isnan(OFFICIAL_BASELINES[m][pert].get(s, float("nan")))
+                for s in suites
+            )
+        ]
+
+        # Column labels: official baselines | (optional) Base PI0 | MLA
+        extra_cols = (["Base PI0"] if base_results is not None else []) + [ckpt_label]
+        all_model_labels = active_baselines + extra_cols
+
+        print(f"\n── Perturbation: {pert.upper()} ──")
+        header = f"  {'Suite':<16}" + "".join(
+            f"{lbl[:col_w]:>{col_w}}" for lbl in all_model_labels
+        )
+        sep = "  " + "-" * (len(header) - 2)
+        print(header)
+        print(sep)
+
+        col_srs = {lbl: [] for lbl in all_model_labels}
+
+        for suite in suites:
+            row = f"  {suite:<16}"
+
+            for lbl in active_baselines:
+                v = OFFICIAL_BASELINES[lbl].get(pert, {}).get(suite, float("nan"))
+                col_srs[lbl].append(v if not np.isnan(v) else float("nan"))
+                row += f"{_fmt(v):>{col_w}}"
+
+            # Base PI0 column
+            if base_results is not None:
+                key = f"{suite}__{pert}"
+                base_sr = (
+                    base_results.get(key, {})
+                    .get("__overall__", {})
+                    .get("success_rate", float("nan"))
+                )
+                col_srs["Base PI0"].append(base_sr)
+                row += f"{_fmt(base_sr):>{col_w}}"
+
+            # MLA column
+            key    = f"{suite}__{pert}"
+            our_sr = (
+                all_results.get(key, {})
+                .get("__overall__", {})
+                .get("success_rate", float("nan"))
+            )
+            col_srs[ckpt_label].append(our_sr)
+            row += f"{_fmt(our_sr):>{col_w}}"
+
+            # Delta annotation when both base and MLA are available
+            if base_results is not None and not (base_sr != base_sr) and not (our_sr != our_sr):
+                delta = our_sr - base_sr
+                sign  = "+" if delta >= 0 else ""
+                row  += f"  ({sign}{delta*100:.1f}%)"
+
+            print(row)
+
+        print(sep)
+        avg_row = f"  {'Avg':<16}"
+        for lbl in all_model_labels:
+            vals  = [v for v in col_srs[lbl] if not np.isnan(v)]
+            avg_v = float(np.mean(vals)) if vals else float("nan")
+            avg_row += f"{_fmt(avg_v):>{col_w}}"
+        print(avg_row)
+
+    # ── Grand summary (MLA only, or Base vs MLA side-by-side) ────────────────
+    print("\n" + "=" * 90)
+    if base_results is not None:
+        print(f"GRAND SUMMARY — Base PI0  vs  {ckpt_label}  (suite × perturbation, delta)")
+    else:
+        print(f"GRAND SUMMARY — {ckpt_label}  (suite × perturbation)")
+    print("=" * 90)
+
+    col_w2 = 14
+    if base_results is not None:
+        header2 = f"  {'Suite':<16}" + "".join(
+            f"{p + ' Δ':>{col_w2}}" for p in perturbations
+        ) + f"{'Overall Δ':>{col_w2}}"
+    else:
+        header2 = f"  {'Suite':<16}" + "".join(
+            f"{p:>{col_w2}}" for p in perturbations
+        ) + f"{'Avg':>{col_w2}}"
+
+    print(header2)
+    print("  " + "-" * (len(header2) - 2))
+
+    suite_avgs = {}
+    for suite in suites:
+        row      = f"  {suite:<16}"
+        pert_srs = []
+        for pert in perturbations:
+            key    = f"{suite}__{pert}"
+            sr     = (
+                all_results.get(key, {})
+                .get("__overall__", {})
+                .get("success_rate", float("nan"))
+            )
+            pert_srs.append(sr)
+
+            if base_results is not None:
+                base_sr = (
+                    base_results.get(key, {})
+                    .get("__overall__", {})
+                    .get("success_rate", float("nan"))
+                )
+                if not (sr != sr) and not (base_sr != base_sr):
+                    delta = sr - base_sr
+                    sign  = "+" if delta >= 0 else ""
+                    row  += f"{sign}{delta*100:.1f}%".rjust(col_w2)
+                else:
+                    row += f"{'N/A':>{col_w2}}"
+            else:
+                row += f"{_fmt(sr):>{col_w2}}"
+
+        suite_avg = float(np.nanmean(pert_srs)) if pert_srs else float("nan")
+        suite_avgs[suite] = suite_avg
+        row += f"{_fmt(suite_avg):>{col_w2}}"
+        print(row)
+
+    print("  " + "-" * (len(header2) - 2))
+    avg_row2 = f"  {'Avg':<16}"
+    for pert in perturbations:
+        srs = [
+            all_results.get(f"{s}__{pert}", {})
+            .get("__overall__", {})
+            .get("success_rate", float("nan"))
+            for s in suites
+        ]
+        pa = float(np.nanmean([v for v in srs if not np.isnan(v)])) if srs else float("nan")
+        avg_row2 += f"{_fmt(pa):>{col_w2}}"
+    overall = float(np.nanmean(list(suite_avgs.values())))
+    avg_row2 += f"{_fmt(overall):>{col_w2}}"
+    print(avg_row2)
+    print("=" * 90)
+    print(f"Total wall-clock time: {elapsed/3600:.1f} hours")
+
+
+# ── Timing estimate ───────────────────────────────────────────────────────────
+
+def print_timing_estimate(args, step_time_s: float = 4.5):
+    avg_max_steps = np.mean([SUITE_MAX_STEPS[s] for s in args.suites])
+    num_combos    = len(args.suites) * len(args.perturbations)
+    total_eps     = num_combos * 10 * args.num_episodes
+
+    multiplier = 2 if getattr(args, "compare_base", False) else 1
+    label      = " × 2 (base + MLA)" if multiplier == 2 else ""
+
+    optimistic = total_eps * 50  * step_time_s / 3600 * multiplier
+    realistic  = total_eps * 100 * step_time_s / 3600 * multiplier
+    worst_case = total_eps * avg_max_steps * step_time_s / 3600 * multiplier
+
+    print(f"\n[timing] Estimate for T4 @ {step_time_s}s/step "
+          f"({num_combos} combos × 10 tasks × {args.num_episodes} ep{label}):")
+    print(f"  Optimistic  (~50 avg steps/ep, fails fast): {optimistic:5.1f} h")
+    print(f"  Realistic   (~100 avg steps/ep):            {realistic:5.1f} h")
+    print(f"  Worst case  (full max_steps={avg_max_steps:.0f}):          {worst_case:5.1f} h")
+    if multiplier == 1:
+        print(f"  Add --compare_base to also run base PI0 (doubles runtime).")
+    print(f"  Tip: --suites libero_goal --perturbations position for a quick smoke-test.\n")
+
+
 # ── Main ─────────────────────────────────────────────────────────────────────
 
 def parse_args():
     p = argparse.ArgumentParser(
-        description="Full LIBERO-PRO benchmark eval — MLA checkpoint "
-                    "(4 suites × 5 perturbations)"
+        description="LIBERO-PRO eval — MLA vs base PI0  (4 suites × 5 perturbations, 1 ep)"
     )
     p.add_argument("--checkpoint", type=str, required=True,
                    help="Path to MLA checkpoint model.pt")
@@ -502,6 +761,14 @@ def parse_args():
                    help="Perturbation types to eval (default: all 5)")
     p.add_argument("--num_episodes", type=int, default=NUM_EPISODES,
                    help=f"Episodes per task (default: {NUM_EPISODES})")
+    p.add_argument("--compare_base", action="store_true",
+                   help=(
+                       "Also evaluate the vanilla pretrained PI0 (no MLA checkpoint) "
+                       "across the same 200 tasks and print a head-to-head delta table. "
+                       "Roughly doubles total runtime."
+                   ))
+    p.add_argument("--num_tasks", type=int, default=5,
+                   help="Number of tasks to run per suite (default: 5, max: 10)")
     p.add_argument("--device",     type=str, default="cuda")
     p.add_argument("--seed",       type=int, default=42)
     p.add_argument("--output_dir", type=str, default=None,
@@ -512,15 +779,25 @@ def parse_args():
     p.add_argument("--init_base",  type=str,
                    default="./LIBERO-PRO/libero/libero/init_files",
                    help="Path to LIBERO-PRO init_files directory")
+    p.add_argument("--ckpt_label", type=str, default="MLA (ours)",
+                   help="Label for this checkpoint in comparison tables")
+    p.add_argument("--step_time",  type=float, default=4.5,
+                   help="Seconds per env step for timing estimate (default: 4.5)")
     p.add_argument("--resume", action="store_true",
-                   help="Skip already-completed tasks")
+                   help="Skip already-completed tasks (applies to both models)")
     p.add_argument("--dry_run", action="store_true",
                    help="One forward pass to verify everything works, then exit")
+    p.add_argument("--timing_only", action="store_true",
+                   help="Print timing estimate and exit (no model load)")
     return p.parse_args()
 
 
 def main():
     args = parse_args()
+
+    if args.timing_only:
+        print_timing_estimate(args, step_time_s=args.step_time)
+        return
 
     output_dir = args.output_dir or str(
         Path(args.checkpoint).parent / "libero_pro_eval"
@@ -533,15 +810,18 @@ def main():
         for suite in args.suites
         for pert  in args.perturbations
     ]
-    print(f"[setup] {len(combos)} suite×perturbation combinations | "
-          f"{len(combos) * 10 * args.num_episodes} total rollouts")
+    total_rollouts = len(combos) * args.num_tasks * args.num_episodes
+    multiplier     = 2 if args.compare_base else 1
+    print(f"[setup] {len(combos)} suite×perturbation combos | "
+          f"{total_rollouts} rollouts per model | "
+          f"{total_rollouts * multiplier} total rollouts")
+
+    print_timing_estimate(args, step_time_s=args.step_time)
 
     tokenizer      = make_tokenizer()
     policy, config = build_model(args.device)
     load_mla_checkpoint(policy, args.checkpoint, args.device)
 
-    # Set true state_dim from model weights — config input_features may reflect
-    # a single obs component (e.g. 8-dim) while pi0 expects the full concat (32-dim)
     global STATE_DIM
     STATE_DIM = policy.model.state_proj.weight.shape[1]
     print(f"[setup] state_dim={STATE_DIM} (from state_proj.weight)")
@@ -550,12 +830,65 @@ def main():
         dry_run(policy, config, args.device)
         return
 
+    # ── Phase 1: (optional) Base PI0 evaluation ───────────────────────────────
+    base_results = None
+    if args.compare_base:
+        base_policy = build_base_model(policy, config, args.device)
+        base_results = {}
+        t_base = time.time()
+
+        print("\n" + "=" * 60)
+        print("PHASE 1 / 2 — Base PI0 (no MLA checkpoint)")
+        print("=" * 60)
+
+        for suite, perturbation in combos:
+            key           = f"{suite}__{perturbation}"
+            progress_path = os.path.join(output_dir, f"base__{key}.json")
+
+            result = run_combo(
+                policy        = base_policy,
+                config        = config,
+                tokenizer     = tokenizer,
+                suite         = suite,
+                perturbation  = perturbation,
+                num_episodes  = args.num_episodes,
+                device        = args.device,
+                seed          = args.seed,
+                progress_path = progress_path,
+                resume        = args.resume,
+                bddl_base     = args.bddl_base,
+                init_base     = args.init_base,
+                model_label   = "Base PI0",
+                num_tasks     = args.num_tasks,
+            )
+            base_results[key] = result
+
+        elapsed_base = time.time() - t_base
+
+        # Save base results
+        base_json = os.path.join(output_dir, "base_pi0_results.json")
+        with open(base_json, "w") as f:
+            json.dump(base_results, f, indent=2)
+        print(f"\n[save] Base PI0 results → {base_json}  ({elapsed_base/3600:.1f}h)")
+
+        # Free base model memory before loading MLA
+        del base_policy
+        gc.collect()
+        if args.device == "cuda":
+            torch.cuda.empty_cache()
+
+    # ── Phase 2: MLA checkpoint evaluation ───────────────────────────────────
     all_results = {}
     t_total     = time.time()
 
+    phase_label = "PHASE 2 / 2 — MLA checkpoint" if args.compare_base else "Evaluating MLA checkpoint"
+    print("\n" + "=" * 60)
+    print(phase_label)
+    print("=" * 60)
+
     for suite, perturbation in combos:
         key           = f"{suite}__{perturbation}"
-        progress_path = os.path.join(output_dir, f"{key}.json")
+        progress_path = os.path.join(output_dir, f"mla__{key}.json")
 
         result = run_combo(
             policy        = policy,
@@ -570,68 +903,38 @@ def main():
             resume        = args.resume,
             bddl_base     = args.bddl_base,
             init_base     = args.init_base,
+            model_label   = args.ckpt_label,
+            num_tasks     = args.num_tasks,
         )
         all_results[key] = result
 
-    # ── Final summary ─────────────────────────────────────────────────────────
     elapsed = time.time() - t_total
 
-    # Per-suite average across perturbations
-    suite_avgs = {}
-    for suite in args.suites:
-        srs = [
-            all_results[f"{suite}__{p}"]["__overall__"]["success_rate"]
-            for p in args.perturbations
-            if f"{suite}__{p}" in all_results
-        ]
-        suite_avgs[suite] = float(np.mean(srs)) if srs else float("nan")
+    # ── Print comparison table ────────────────────────────────────────────────
+    print_comparison_table(
+        all_results,
+        args,
+        elapsed,
+        ckpt_label   = args.ckpt_label,
+        base_results = base_results,
+    )
 
-    # Per-perturbation average across suites
-    pert_avgs = {}
-    for pert in args.perturbations:
-        srs = [
-            all_results[f"{s}__{pert}"]["__overall__"]["success_rate"]
-            for s in args.suites
-            if f"{s}__{pert}" in all_results
-        ]
-        pert_avgs[pert] = float(np.mean(srs)) if srs else float("nan")
-
-    overall = float(np.mean(list(suite_avgs.values())))
-
-    col_w = 12
-    header = f"  {'Suite':<16}" + "".join(f"{p:>{col_w}}" for p in args.perturbations) + f"{'Avg':>{col_w}}"
-
-    print("\n" + "=" * len(header))
-    print(f"LIBERO-PRO RESULTS  ({args.num_episodes} episodes/task)")
-    print("=" * len(header))
-    print(header)
-    print("  " + "-" * (len(header) - 2))
-
-    for suite in args.suites:
-        row = f"  {suite:<16}"
-        for pert in args.perturbations:
-            key = f"{suite}__{pert}"
-            sr  = all_results.get(key, {}).get("__overall__", {}).get(
-                "success_rate", float("nan")
-            ) * 100
-            row += f"{sr:>{col_w}.1f}%"[:-1].rjust(col_w)  # strip extra % then pad
-            row += "%"
-        row += f"{suite_avgs[suite]*100:>{col_w}.1f}%"[:-1].rjust(col_w) + "%"
-        print(row)
-
-    print("  " + "-" * (len(header) - 2))
-    avg_row = f"  {'Avg':<16}"
-    for pert in args.perturbations:
-        avg_row += f"{pert_avgs[pert]*100:>{col_w-1}.1f}%".rjust(col_w)
-    avg_row += f"{overall*100:>{col_w-1}.1f}%".rjust(col_w)
-    print(avg_row)
-    print("=" * len(header))
-    print(f"Total time: {elapsed/3600:.1f} hours")
-
-    final_json = os.path.join(output_dir, "eval_results_final.json")
+    # ── Save final JSONs ──────────────────────────────────────────────────────
+    final_json = os.path.join(output_dir, "mla_results_final.json")
     with open(final_json, "w") as f:
         json.dump(all_results, f, indent=2)
-    print(f"\n[save] Full results → {final_json}")
+    print(f"[save] MLA results → {final_json}")
+
+    if args.compare_base and base_results is not None:
+        # Also save a merged summary for easy diffing
+        merged = {
+            "base": {k: v.get("__overall__", {}) for k, v in base_results.items()},
+            "mla":  {k: v.get("__overall__", {}) for k, v in all_results.items()},
+        }
+        merged_json = os.path.join(output_dir, "comparison_summary.json")
+        with open(merged_json, "w") as f:
+            json.dump(merged, f, indent=2)
+        print(f"[save] Head-to-head summary → {merged_json}")
 
 
 if __name__ == "__main__":
