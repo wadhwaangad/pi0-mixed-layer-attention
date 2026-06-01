@@ -221,22 +221,6 @@ def load_mla_checkpoint(policy, ckpt_path: str, device: str):
     return policy
 
 
-def build_base_model(policy_with_mla, config, device: str):
-    """
-    Return a copy of the policy with MLA weights zeroed / reset so it behaves
-    identically to the vanilla pretrained PI0 (no MLA fine-tuning).
-
-    We do this by building a fresh model from scratch (pretrained weights only)
-    rather than trying to surgically remove the MLA deltas, which avoids any
-    risk of contamination from the fine-tuned checkpoint.
-    """
-    print("\n[base] Building a clean base PI0 (no MLA checkpoint) ...")
-    base_policy, _ = build_model(device)
-    base_policy.eval()
-    print("[base] Base model ready.")
-    return base_policy
-
-
 # ── Tokenizer ────────────────────────────────────────────────────────────────
 
 def make_tokenizer():
@@ -477,6 +461,8 @@ def run_combo(
                 print(f"    ep {ep} ERROR: {e}")
                 successes.append(0.0)
                 steps_list.append(0)
+            finally:
+                torch.cuda.empty_cache()
 
         env.close()
 
@@ -793,6 +779,8 @@ def parse_args():
 
 
 def main():
+    global STATE_DIM  # declare once at the top, before any assignments
+
     args = parse_args()
 
     if args.timing_only:
@@ -825,17 +813,17 @@ def main():
     if args.compare_base:
         # Build BASE first, before MLA is ever loaded to GPU
         base_policy, config = build_model(args.device)
-        # Do NOT load MLA checkpoint — this IS the base
-        base_results = {}
-        t_base = time.time()
+        # Do NOT call load_mla_checkpoint — this IS the base
 
-        global STATE_DIM
         STATE_DIM = base_policy.model.state_proj.weight.shape[1]
         print(f"[setup] state_dim={STATE_DIM} (from state_proj.weight)")
 
         if args.dry_run:
             dry_run(base_policy, config, args.device)
             return
+
+        base_results = {}
+        t_base = time.time()
 
         print("\n" + "=" * 60)
         print("PHASE 1 / 2 — Base PI0 (no MLA checkpoint)")
@@ -879,7 +867,6 @@ def main():
     policy, config = build_model(args.device)
     load_mla_checkpoint(policy, args.checkpoint, args.device)
 
-    global STATE_DIM
     STATE_DIM = policy.model.state_proj.weight.shape[1]
     print(f"[setup] state_dim={STATE_DIM} (from state_proj.weight)")
 
