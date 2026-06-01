@@ -36,7 +36,7 @@ SUITE_MAX_STEPS = {
     "libero_object":  280,
 }
 
-ALL_PERTURBATIONS = ["position", "object", "semantic", "task", "environment"]
+ALL_PERTURBATIONS = ["position", "object", "semantic", "task"]
 
 PERTURBATION_TO_FLAG = {
     "position":    "use_swap",
@@ -272,13 +272,12 @@ def run_episode(policy, env, lang_tokens, device, config, max_steps: int) -> tup
         with torch.no_grad():
             action = policy.select_action(obs_tensor)
 
-        action_np = action.cpu().numpy().squeeze(0)
-        for step_action in action_np:
-            obs, _reward, done, info = env.step(step_action)
-            steps_taken += 1
-            ep_success = ep_success or bool(info.get("success", False))
-            if done or ep_success or steps_taken >= max_steps:
-                return ep_success, steps_taken
+        action_np = action.cpu().numpy().flatten()  # always (action_dim,)
+        obs, _reward, done, info = env.step(action_np)
+        steps_taken += 1
+        ep_success = ep_success or bool(info.get("success", False))
+        if done or ep_success or steps_taken >= max_steps:
+            return ep_success, steps_taken
 
     return ep_success, steps_taken
 
