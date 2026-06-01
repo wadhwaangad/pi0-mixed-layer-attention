@@ -259,13 +259,12 @@ def run_episode(policy, env, lang_tokens, device, config, max_steps: int) -> tup
             "observation.images.image": torch.from_numpy(
                 obs["agentview_image"].transpose(2, 0, 1)[None]
             ).float().to(device) / 255.0,
-
+        
             "observation.images.image2": torch.from_numpy(
-                obs["agentview_image"].transpose(2, 0, 1)[None]
+                obs["robot0_eye_in_hand_image"].transpose(2, 0, 1)[None]  # ← was agentview_image
             ).float().to(device) / 255.0,
-
+        
             "observation.state": _build_state(obs, STATE_DIM, device),
-
             **lang_tokens,
         }
 
@@ -321,8 +320,9 @@ def run_combo(
         try:
             env = OffScreenRenderEnv(
                 bddl_file_name=benchmark.get_task_bddl_file_path(task_idx),
-                camera_heights=128,
-                camera_widths=128,
+                camera_names=["agentview", "robot0_eye_in_hand"],
+                camera_heights=224,
+                camera_widths=224,
             )
             env.seed(seed)
         except Exception as e:
