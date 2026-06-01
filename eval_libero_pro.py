@@ -42,28 +42,28 @@ Official LIBERO-PRO baselines (Zhou et al. 2025, arXiv:2510.03827):
 
 Usage:
     # Sanity check first
-    python eval_libero_pro.py \\
-        --checkpoint ./outputs/mixed_layer_attention/checkpoint_006000/model.pt \\
+    python eval_libero_pro.py \
+        --checkpoint ./outputs/mixed_layer_attention/checkpoint_006000/model.pt \
         --dry_run
 
     # Full benchmark — 1 episode, all 4 suites, all 5 perturbations (200 rollouts)
-    python eval_libero_pro.py \\
+    python eval_libero_pro.py \
         --checkpoint ./outputs/mixed_layer_attention/checkpoint_006000/model.pt
 
     # Head-to-head: base PI0 vs your MLA checkpoint (400 rollouts total)
-    python eval_libero_pro.py \\
-        --checkpoint ./outputs/mixed_layer_attention/checkpoint_006000/model.pt \\
+    python eval_libero_pro.py \
+        --checkpoint ./outputs/mixed_layer_attention/checkpoint_006000/model.pt \
         --compare_base
 
     # Resume after preemption
-    python eval_libero_pro.py \\
-        --checkpoint ./outputs/mixed_layer_attention/checkpoint_006000/model.pt \\
+    python eval_libero_pro.py \
+        --checkpoint ./outputs/mixed_layer_attention/checkpoint_006000/model.pt \
         --resume
 
     # Specific suites / perturbations only
-    python eval_libero_pro.py \\
-        --checkpoint ./outputs/mixed_layer_attention/checkpoint_006000/model.pt \\
-        --suites libero_goal libero_spatial \\
+    python eval_libero_pro.py \
+        --checkpoint ./outputs/mixed_layer_attention/checkpoint_006000/model.pt \
+        --suites libero_goal libero_spatial \
         --perturbations position object
 
 Timing estimate on T4 (4-5s/step, 1 episode):
@@ -89,7 +89,7 @@ from safetensors.torch import load_file
 from transformers import AutoTokenizer
 
 from lerobot.configs.types import FeatureType, PolicyFeature
-from lerobot.policies.pi0 import PI0Config
+from lerobot.policies.pi0 import PI0Config, PI0Policy
 from pi0_policy_mixed_layer_attention import PI0PolicyMixedLayerAttention
 
 # ── LIBERO-PRO path ───────────────────────────────────────────────────────────
@@ -174,8 +174,19 @@ OFFICIAL_BASELINES = {
 
 # ── Model ────────────────────────────────────────────────────────────────────
 
-def build_model(device: str):
+def build_model(device: str, use_mla: bool = True):
+    """
+    Build and return a policy loaded with pretrained PI0 weights.
+
+    Args:
+        device:  Target device string, e.g. "cuda" or "cpu".
+        use_mla: If True (default), construct PI0PolicyMixedLayerAttention.
+                 If False, construct vanilla PI0Policy (for --compare_base baseline).
+    """
+    policy_cls = PI0PolicyMixedLayerAttention if use_mla else PI0Policy
+    label      = "PI0PolicyMixedLayerAttention" if use_mla else "PI0Policy (vanilla base)"
     print(f"\n[build] Loading config from {MODEL_ID} ...")
+    print(f"[build] Policy class: {label}")
     config_path = hf_hub_download(MODEL_ID, "config.json")
     with open(config_path) as f:
         config_dict = json.load(f)
@@ -194,8 +205,8 @@ def build_model(device: str):
         )
 
     config = PI0Config(**config_dict)
-    print("[build] Constructing model on CPU ...")
-    policy = PI0PolicyMixedLayerAttention(config)
+    print(f"[build] Constructing {label} on CPU ...")
+    policy = policy_cls(config)
 
     print("[build] Loading pretrained weights ...")
     weights_path = hf_hub_download(MODEL_ID, "model.safetensors")
@@ -351,19 +362,19 @@ def run_episode(policy, env, lang_tokens, device, config, max_steps: int) -> tup
     ep_success = False
     steps_taken = 0
 
-    while steps_taken < max_steps:
-        obs_tensor = {
-            "observation.image": torch.from_numpy(
-                obs["agentview_image"].transpose(2, 0, 1)[None]
-            ).float().to(device) / 255.0,
-
-            "observation.image_mask": torch.ones(
-                1, 1, dtype=torch.bool, device=device
-            ),
-
-            "observation.state": _build_state(obs, STATE_DIM, device),
-
-            **lang_tokens,
+    while steps_taken < max_steps: 
+      obs_tensor = {
+              "observation.images.image": torch.from_numpy(
+                  obs["agentview_image"].transpose(2, 0, 1)[None]
+              ).float().to(device) / 255.0,
+  
+              "observation.images.image2": torch.from_numpy(
+                  obs["agentview_image"].transpose(2, 0, 1)[None]
+              ).float().to(device) / 255.0,
+  
+              "observation.state": _build_state(obs, STATE_DIM, device),
+  
+              **lang_tokens,
         }
 
         with torch.no_grad():
@@ -532,9 +543,10 @@ def dry_run(policy, config, device):
             time        = torch.rand(B, device=device, dtype=torch.bfloat16),
         )
     print(f"[dry-run] Forward OK — loss mean: {loss.mean().item():.4f}")
-    weights = policy.model.mla.get_layer_weights()
-    print(f"[dry-run] MLA weights layer 17: "
-          f"{[round(x, 3) for x in weights[-1].tolist()]}")
+    if hasattr(policy.model, "mla"):
+        weights = policy.model.mla.get_layer_weights()
+        print(f"[dry-run] MLA weights layer 17: "
+              f"{[round(x, 3) for x in weights[-1].tolist()]}")
     print("[dry-run] All good.\n")
 
 
@@ -754,7 +766,7 @@ def parse_args():
     p.add_argument("--compare_base", action="store_true",
                    help=(
                        "Also evaluate the vanilla pretrained PI0 (no MLA checkpoint) "
-                       "across the same 200 tasks and print a head-to-head delta table. "
+                       "across the same tasks and print a head-to-head delta table. "
                        "Roughly doubles total runtime."
                    ))
     p.add_argument("--num_tasks", type=int, default=5,
@@ -815,9 +827,10 @@ def main():
     # ── Phase 1: (optional) Base PI0 evaluation ───────────────────────────────
     base_results = None
     if args.compare_base:
-        # Build BASE first, before MLA is ever loaded to GPU
-        base_policy, config = build_model(args.device)
-        # Do NOT call load_mla_checkpoint — this IS the base
+        # Build vanilla PI0Policy — NO MLA weights, NO MLA architecture.
+        # use_mla=False ensures PI0Policy (not PI0PolicyMixedLayerAttention)
+        # is constructed, giving a clean apples-to-apples baseline.
+        base_policy, config = build_model(args.device, use_mla=False)
 
         STATE_DIM = base_policy.model.state_proj.weight.shape[1]
         print(f"[setup] state_dim={STATE_DIM} (from state_proj.weight)")
@@ -830,7 +843,7 @@ def main():
         t_base = time.time()
 
         print("\n" + "=" * 60)
-        print("PHASE 1 / 2 — Base PI0 (no MLA checkpoint)")
+        print("PHASE 1 / 2 — Base PI0 (vanilla, no MLA)")
         print("=" * 60)
 
         for suite, perturbation in combos:
@@ -868,7 +881,8 @@ def main():
               f"{torch.cuda.memory_allocated()/1e9:.1f}GB allocated")
 
     # ── Phase 2: MLA checkpoint evaluation ───────────────────────────────────
-    policy, config = build_model(args.device)
+    # Always use_mla=True here — this is the PI0PolicyMixedLayerAttention run.
+    policy, config = build_model(args.device, use_mla=True)
     load_mla_checkpoint(policy, args.checkpoint, args.device)
 
     STATE_DIM = policy.model.state_proj.weight.shape[1]
