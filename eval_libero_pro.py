@@ -818,24 +818,24 @@ def main():
 
     print_timing_estimate(args, step_time_s=args.step_time)
 
-    tokenizer      = make_tokenizer()
-    policy, config = build_model(args.device)
-    load_mla_checkpoint(policy, args.checkpoint, args.device)
-
-    global STATE_DIM
-    STATE_DIM = policy.model.state_proj.weight.shape[1]
-    print(f"[setup] state_dim={STATE_DIM} (from state_proj.weight)")
-
-    if args.dry_run:
-        dry_run(policy, config, args.device)
-        return
+    tokenizer = make_tokenizer()
 
     # ── Phase 1: (optional) Base PI0 evaluation ───────────────────────────────
     base_results = None
     if args.compare_base:
-        base_policy = build_base_model(policy, config, args.device)
+        # Build BASE first, before MLA is ever loaded to GPU
+        base_policy, config = build_model(args.device)
+        # Do NOT load MLA checkpoint — this IS the base
         base_results = {}
         t_base = time.time()
+
+        global STATE_DIM
+        STATE_DIM = base_policy.model.state_proj.weight.shape[1]
+        print(f"[setup] state_dim={STATE_DIM} (from state_proj.weight)")
+
+        if args.dry_run:
+            dry_run(base_policy, config, args.device)
+            return
 
         print("\n" + "=" * 60)
         print("PHASE 1 / 2 — Base PI0 (no MLA checkpoint)")
@@ -844,7 +844,6 @@ def main():
         for suite, perturbation in combos:
             key           = f"{suite}__{perturbation}"
             progress_path = os.path.join(output_dir, f"base__{key}.json")
-
             result = run_combo(
                 policy        = base_policy,
                 config        = config,
@@ -864,20 +863,30 @@ def main():
             base_results[key] = result
 
         elapsed_base = time.time() - t_base
-
-        # Save base results
         base_json = os.path.join(output_dir, "base_pi0_results.json")
         with open(base_json, "w") as f:
             json.dump(base_results, f, indent=2)
         print(f"\n[save] Base PI0 results → {base_json}  ({elapsed_base/3600:.1f}h)")
 
-        # Free base model memory before loading MLA
+        # Free base model COMPLETELY before loading MLA
         del base_policy
         gc.collect()
-        if args.device == "cuda":
-            torch.cuda.empty_cache()
+        torch.cuda.empty_cache()
+        print(f"[mem] After base cleanup: "
+              f"{torch.cuda.memory_allocated()/1e9:.1f}GB allocated")
 
     # ── Phase 2: MLA checkpoint evaluation ───────────────────────────────────
+    policy, config = build_model(args.device)
+    load_mla_checkpoint(policy, args.checkpoint, args.device)
+
+    global STATE_DIM
+    STATE_DIM = policy.model.state_proj.weight.shape[1]
+    print(f"[setup] state_dim={STATE_DIM} (from state_proj.weight)")
+
+    if args.dry_run and not args.compare_base:
+        dry_run(policy, config, args.device)
+        return
+
     all_results = {}
     t_total     = time.time()
 
@@ -926,7 +935,6 @@ def main():
     print(f"[save] MLA results → {final_json}")
 
     if args.compare_base and base_results is not None:
-        # Also save a merged summary for easy diffing
         merged = {
             "base": {k: v.get("__overall__", {}) for k, v in base_results.items()},
             "mla":  {k: v.get("__overall__", {}) for k, v in all_results.items()},
