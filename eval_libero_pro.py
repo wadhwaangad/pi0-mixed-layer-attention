@@ -410,12 +410,12 @@ def dry_run(policy, config, device):
             lang_tokens = torch.randint(0, 256_000, (B, T_lang), device=device),
             lang_masks  = torch.ones(B, T_lang, dtype=torch.bool, device=device),
             state       = torch.randn(B, state_dim,
-                                      device=device, dtype=torch.bfloat16),
+                                      device=device, dtype=torch.float32),
             actions     = torch.randn(B, chunk, state_dim,
-                                      device=device, dtype=torch.bfloat16),
+                                      device=device, dtype=torch.float32),
             noise       = torch.randn(B, chunk, state_dim,
-                                      device=device, dtype=torch.bfloat16),
-            time        = torch.rand(B, device=device, dtype=torch.bfloat16),
+                                      device=device, dtype=torch.float32),
+            time        = torch.rand(B, device=device, dtype=torch.float32),
         )
     print(f"[dry-run] Forward OK — loss mean: {loss.mean().item():.4f}")
     if hasattr(policy.model, "mla"):
