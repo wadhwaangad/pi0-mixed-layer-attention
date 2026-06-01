@@ -92,6 +92,10 @@ from lerobot.configs.types import FeatureType, PolicyFeature
 from lerobot.policies.pi0 import PI0Config
 from pi0_policy_mixed_layer_attention import PI0PolicyMixedLayerAttention
 
+# ── LIBERO-PRO path ───────────────────────────────────────────────────────────
+import sys
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "LIBERO-PRO"))
+
 # ── Constants ────────────────────────────────────────────────────────────────
 
 MODEL_ID = "lerobot/pi0_libero_base"
@@ -271,10 +275,10 @@ def ensure_perturbed_suite(
     Returns the perturbed suite name e.g. 'libero_goal_swap'.
     """
     try:
-        from LIBERO_PRO import perturbation as libero_perturbation
+        import perturbation as libero_perturbation
     except ImportError:
         raise ImportError(
-            "LIBERO-PRO not installed.\n"
+            "LIBERO-PRO not found. Clone it next to this script:\n"
             "  git clone https://github.com/Zxy-MLlab/LIBERO-PRO\n"
             "  cd LIBERO-PRO && pip install -e ."
         )
