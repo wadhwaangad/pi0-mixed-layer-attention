@@ -42,6 +42,14 @@ class LoRALinear(nn.Module):
     def forward(self, x):
         return self.linear(x) + (x @ self.A.to(x.dtype) @ self.B.to(x.dtype)) / self.rank
 
+    @property
+    def weight(self):
+        return self.linear.weight
+
+    @property
+    def bias(self):
+        return self.linear.bias
+
 
 class PI0PytorchMixedLayerAttention(PI0Pytorch):
     def __init__(self, config, lora_rank: int = 16):
