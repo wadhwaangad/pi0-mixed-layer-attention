@@ -26,7 +26,7 @@ import sys
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "LIBERO-PRO"))
 
 # FIX 1: use the finetuned checkpoint — base was never trained to solve LIBERO tasks
-MODEL_ID = "lerobot/pi0_libero_finetuned"
+MODEL_ID = "lerobot/pi0_libero_finetuned_v044"
 
 NUM_EPISODES = 1
 
