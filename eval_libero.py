@@ -285,6 +285,8 @@ def run_suite(
                 steps_list.append(steps)
                 total_steps_taken += steps
             except Exception as e:
+                import traceback
+                traceback.print_exc()
                 print(f"    ep {ep} ERROR: {e}")
                 successes.append(0.0)
                 steps_list.append(0)
