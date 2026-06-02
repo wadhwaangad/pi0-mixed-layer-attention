@@ -21,13 +21,13 @@ from pi0_policy_mixed_layer_attention import PI0PolicyMixedLayerAttention
 DEVICE        = "cuda"
 BATCH_SIZE    = 2
 ACCUM_STEPS   = 2
-NUM_STEPS     = 1000     
+NUM_STEPS     = 2000     
 LR            = 3e-4
 LR_MLA        = 3e-3
 WEIGHT_DECAY  = 1e-5
 GRAD_CLIP     = 1.0
 LOG_EVERY     = 10
-SAVE_EVERY    = 500
+SAVE_EVERY    = 1000
 WARMUP_STEPS  = 0           # set > 0 if you want a fresh warmup after resume
 
 OUTPUT_DIR    = "./outputs/mixed_layer_attention_continued"
