@@ -173,6 +173,7 @@ def _build_obs_dict(obs: dict, task_str: str) -> dict:
         # Images: HWC uint8 numpy → preprocess will handle normalization + resize
         "observation.images.image":  obs["agentview_image"],
         "observation.images.image2": obs["robot0_eye_in_hand_image"],
+        "observation.images.empty_camera_0": np.zeros((224, 224, 3), dtype=np.uint8)
         # State: raw numpy, preprocess will normalize
         "observation.state": state,
         # Language: raw string, preprocess will tokenize
