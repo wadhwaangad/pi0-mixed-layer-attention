@@ -195,6 +195,10 @@ def _build_state(obs: dict, state_dim: int, device) -> torch.Tensor:
 
 def run_episode(policy, env, lang_tokens, device, config, max_steps: int) -> tuple[bool, int]:
     obs         = env.reset()
+    print(f"[debug] agentview shape: {obs['agentview_image'].shape}")
+    print(f"[debug] wrist key exists: {'robot0_eye_in_hand_image' in obs}")
+    print(f"[debug] agentview dtype: {obs['agentview_image'].dtype}")
+    print(f"[debug] agentview min/max: {obs['agentview_image'].min()} {obs['agentview_image'].max()}")
     ep_success  = False
     steps_taken = 0
 
@@ -217,6 +221,9 @@ def run_episode(policy, env, lang_tokens, device, config, max_steps: int) -> tup
             action = policy.select_action(obs_tensor)
 
         action_np = action.cpu().numpy().flatten()
+        print(f"[debug] action shape: {action_np.shape}")
+        print(f"[debug] action sample: {action_np[:7].round(3)}")
+        print(f"[debug] action min/max: {action_np.min():.3f} {action_np.max():.3f}")
         obs, _reward, done, info = env.step(action_np)
         steps_taken += 1
         ep_success = ep_success or bool(info.get("success", False))
