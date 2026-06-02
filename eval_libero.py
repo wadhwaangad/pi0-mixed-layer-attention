@@ -179,7 +179,7 @@ def _build_obs_dict(obs: dict, task_str: str) -> dict:
         # State: raw numpy, preprocess will normalize
         "observation.state": state,
         # Language: raw string, preprocess will tokenize
-        "observation.language_instruction": task_str,
+        "task": task_str,
     }
 
 
