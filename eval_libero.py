@@ -175,43 +175,14 @@ def save_progress(path: str, results: dict):
 # Proprioceptive state
 # ---------------------------------------------------------------------------
 
-STATE_DIM: int = 32
-
-_PROPRIO_KEYS = [
-    "robot0_joint_pos_cos",
-    "robot0_joint_pos_sin",
-    "robot0_joint_vel",
-    "robot0_gripper_qpos",
-    "robot0_eef_pos",
-    "robot0_eef_quat",
-    "robot0_gripper_qvel",
-    "robot0_eef_vel",
-]
-
-
-def _build_state(obs: dict, state_dim: int, device) -> torch.Tensor:
-    parts = []
-    for key in _PROPRIO_KEYS:
-        if key in obs:
-            parts.append(obs[key].astype(np.float32).flatten())
-    if not parts:
-        raise KeyError(
-            f"None of the expected proprioceptive keys found in obs. "
-            f"Available keys: {list(obs.keys())}"
-        )
-    vec = np.concatenate(parts)
-    if vec.shape[0] >= state_dim:
-        vec = vec[:state_dim]
-    else:
-        vec = np.pad(vec, (0, state_dim - vec.shape[0]))
-    state = torch.from_numpy(vec).unsqueeze(0).to(device)
-    # normalize using training dataset stats (MEAN_STD)
-    n     = state.shape[-1]
-    mean  = STATE_MEAN[:n].to(device)
-    std   = STATE_STD[:n].to(device)
-    state = (state - mean) / (std + 1e-8)
-    return state
-
+def build_state(obs, device):
+    """
+    Use canonical LIBERO state if available.
+    This is what PI0 is trained on.
+    """
+    state = obs["state"]  
+    state = torch.from_numpy(state.astype(np.float32))
+    return state.unsqueeze(0).to(device)
 
 # ---------------------------------------------------------------------------
 # Episode / suite runners
@@ -232,7 +203,7 @@ def run_episode(policy, env, lang_tokens, device, config, max_steps: int) -> tup
                 obs["robot0_eye_in_hand_image"].transpose(2, 0, 1)[None]
             ).float().to(device) / 255.0,
 
-            "observation.state": _build_state(obs, STATE_DIM, device),
+            "observation.state": _build_state(obs, device),
 
             **lang_tokens,
         }
