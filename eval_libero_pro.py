@@ -92,7 +92,7 @@ OFFICIAL_BASELINES = {
     },
 }
 
-CAMERA_RESOLUTION = 224
+CAMERA_RESOLUTION = 256
 STATE_DIM: int    = 8
 
 _PROPRIO_KEYS = [
@@ -195,7 +195,7 @@ def _build_obs_dict(obs: dict, task_str: str) -> dict:
         "observation.images.image2": obs["robot0_eye_in_hand_image"],
         "observation.images.empty_camera_0": np.zeros((224, 224, 3), dtype=np.uint8),
         "observation.state": state,
-        "observation.language_instruction": task_str,
+        "task": task_str,
     }
 
 
