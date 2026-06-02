@@ -21,6 +21,7 @@ from lerobot.configs.types import FeatureType, PolicyFeature
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.policies.pi0 import PI0Config, PI0Policy
 from pi0_policy_mixed_layer_attention import PI0PolicyMixedLayerAttention
+from scipy.spatial.transform import Rotation as R
 
 import sys
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "LIBERO-PRO"))
@@ -289,16 +290,12 @@ def ensure_perturbed_suite(suite, perturbation, bddl_base, init_base):
 # ---------------------------------------------------------------------------
 
 def _build_state(obs: dict, state_dim: int, device) -> torch.Tensor:
-    parts = []
-    for key in _PROPRIO_KEYS:
-        if key in obs:
-            parts.append(obs[key].astype(np.float32).flatten())
-        else:
-            raise KeyError(
-                f"Expected proprioceptive key '{key}' not found in obs. "
-                f"Available keys: {list(obs.keys())}"
-            )
-    vec = np.concatenate(parts)
+    eef_pos = obs["robot0_eef_pos"].astype(np.float32)
+    eef_rotvec = R.from_quat(
+        obs["robot0_eef_quat"]
+    ).as_rotvec().astype(np.float32)
+    gripper = obs["robot0_gripper_qpos"].astype(np.float32)
+    vec = np.concatenate([eef_pos, eef_rotvec, gripper])
     if vec.shape[0] != state_dim:
         raise ValueError(
             f"State vector has {vec.shape[0]} dims but STATE_DIM={state_dim}. "
