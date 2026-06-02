@@ -198,6 +198,11 @@ def run_episode(
         # image transforms, and device placement, exactly like the reference script
         raw_obs = _build_obs_dict(obs, task_str)
         batch   = preprocess(raw_obs)
+        print(raw_obs)
+        for k, v in batch.items():
+            if hasattr(v, 'shape'):
+                print(f"  {k}: {v.shape}")
+        raise SystemExit
 
         with torch.inference_mode():
             action = policy.select_action(batch)
