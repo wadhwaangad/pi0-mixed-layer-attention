@@ -17,7 +17,7 @@ from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.policies.factory import make_pre_post_processors
 from lerobot.policies.pi0 import PI0Policy
 from pi0_policy_mixed_layer_attention import PI0PolicyMixedLayerAttention
-
+from scipy.spatial.transform import Rotation as R
 MODEL_ID     = "lerobot/pi0_libero_finetuned_v044"
 NUM_EPISODES = 1
 
@@ -155,14 +155,15 @@ def _build_obs_dict(obs: dict, task_str: str) -> dict:
     mirroring the keys used in LeRobotDataset frames.
     """
     # Build state vector: eef_pos(3) + eef_quat(4) + gripper_qpos(1) = 8
-    parts = []
-    for key in _PROPRIO_KEYS:
-        if key not in obs:
-            raise KeyError(
-                f"Expected key '{key}' not in obs. Available: {list(obs.keys())}"
-            )
-        parts.append(obs[key].astype(np.float32).flatten())
-    state = np.concatenate(parts)
+    eef_pos = obs["robot0_eef_pos"].astype(np.float32)
+
+    eef_rotvec = R.from_quat(
+        obs["robot0_eef_quat"]
+    ).as_rotvec().astype(np.float32)
+    
+    gripper = obs["robot0_gripper_qpos"].astype(np.float32)
+    
+    state = np.concatenate([eef_pos, eef_rotvec, gripper])
     if state.shape[0] != STATE_DIM:
         raise ValueError(
             f"State has {state.shape[0]} dims, expected {STATE_DIM}. "
@@ -173,7 +174,7 @@ def _build_obs_dict(obs: dict, task_str: str) -> dict:
         # Images: HWC uint8 numpy → preprocess will handle normalization + resize
         "observation.images.image":  obs["agentview_image"],
         "observation.images.image2": obs["robot0_eye_in_hand_image"],
-        "observation.images.empty_camera_0": np.zeros((224, 224, 3), dtype=np.uint8)
+        "observation.images.empty_camera_0": np.zeros((224, 224, 3), dtype=np.uint8),
         # State: raw numpy, preprocess will normalize
         "observation.state": state,
         # Language: raw string, preprocess will tokenize
