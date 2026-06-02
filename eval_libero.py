@@ -1,16 +1,5 @@
 """
 eval_libero.py — Full LIBERO standard benchmark evaluation for PI0 + MixedLayerAttention.
-
-Evaluates on the 4 standard LIBERO suites (libero_goal, libero_spatial, libero_10,
-libero_object) without any perturbations. Mirrors eval_libero_pro.py in structure,
-output format, and CLI interface.
-
-FIXES applied vs original:
-  1. MODEL_ID changed to lerobot/pi0_libero_finetuned (base was never trained on tasks)
-  2. Camera resolution changed to 256x256 (config shows [3,256,256], not 224)
-  3. STATE_DIM set to 8 to match observation.state shape [8] in config
-  4. _PROPRIO_KEYS corrected to exactly the 8-dim state used during training
-  5. Normalization stats loaded from dataset and applied to state + actions
 """
 
 import argparse
@@ -22,18 +11,14 @@ from pathlib import Path
 
 import numpy as np
 import torch
-from huggingface_hub import hf_hub_download
-from safetensors.torch import load_file
 from transformers import AutoTokenizer
 
-from lerobot.configs.types import FeatureType, PolicyFeature
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
-from lerobot.policies.pi0 import PI0Config, PI0Policy
+from lerobot.policies.factory import make_pre_post_processors
+from lerobot.policies.pi0 import PI0Policy
 from pi0_policy_mixed_layer_attention import PI0PolicyMixedLayerAttention
 
-# FIX 1: use the finetuned checkpoint — base was never trained to solve LIBERO tasks
-MODEL_ID = "lerobot/pi0_libero_finetuned_v044"
-
+MODEL_ID     = "lerobot/pi0_libero_finetuned_v044"
 NUM_EPISODES = 1
 
 ALL_SUITES = ["libero_goal", "libero_spatial", "libero_10", "libero_object"]
@@ -45,7 +30,6 @@ SUITE_MAX_STEPS = {
     "libero_object":  280,
 }
 
-# Official published success rates on standard (unperturbed) LIBERO
 OFFICIAL_BASELINES = {
     "pi0 (baseline)": {
         "libero_goal":    0.92,
@@ -67,20 +51,9 @@ OFFICIAL_BASELINES = {
     },
 }
 
-
-# ---------------------------------------------------------------------------
-# FIX 2: correct image resolution (config input_features shape is [3,256,256])
-# ---------------------------------------------------------------------------
 CAMERA_RESOLUTION = 256
+STATE_DIM: int    = 8
 
-# ---------------------------------------------------------------------------
-# FIX 3: correct state dim — observation.state shape in config is [8], not 32
-# ---------------------------------------------------------------------------
-STATE_DIM: int = 8
-
-# FIX 4: correct proprioceptive keys that sum to exactly 8 dimensions.
-# eef_pos=3, eef_quat=4, gripper_qpos=1 → 8 total.
-# These match what lerobot/pi0_libero_finetuned was trained on.
 _PROPRIO_KEYS = [
     "robot0_eef_pos",       # 3-dim
     "robot0_eef_quat",      # 4-dim
@@ -89,92 +62,41 @@ _PROPRIO_KEYS = [
 
 
 # ---------------------------------------------------------------------------
-# FIX 5: normalization helpers
-# Load dataset norm stats once at startup and use them every step.
-# Without this, state is in raw units and actions are in normalised space —
-# both silently produce wrong behaviour.
-# ---------------------------------------------------------------------------
-
-def load_norm_stats(model_id: str) -> dict:
-    """Load mean/std normalisation statistics from the LeRobot dataset metadata."""
-    print(f"[norm] Loading normalisation stats from dataset: {model_id}")
-    dataset = LeRobotDataset(model_id)
-    stats = dataset.meta.stats  # dict: key -> {"mean": tensor, "std": tensor}
-    print(f"[norm] Stats loaded for keys: {list(stats.keys())}")
-    return stats
-
-
-def normalize_state(state_tensor: torch.Tensor, stats: dict) -> torch.Tensor:
-    """Z-score normalise state using dataset statistics."""
-    key = "observation.state"
-    if key not in stats:
-        return state_tensor  # no stats available, pass through
-    mean = torch.tensor(stats[key]["mean"], dtype=state_tensor.dtype,
-                        device=state_tensor.device)
-    std  = torch.tensor(stats[key]["std"],  dtype=state_tensor.dtype,
-                        device=state_tensor.device)
-    return (state_tensor - mean) / (std + 1e-8)
-
-
-def denormalize_action(action_tensor: torch.Tensor, stats: dict) -> torch.Tensor:
-    """Undo z-score normalisation on predicted actions."""
-    key = "action"
-    if key not in stats:
-        return action_tensor  # no stats available, pass through
-    mean = torch.tensor(stats[key]["mean"], dtype=action_tensor.dtype,
-                        device=action_tensor.device)
-    std  = torch.tensor(stats[key]["std"],  dtype=action_tensor.dtype,
-                        device=action_tensor.device)
-    return action_tensor * std + mean
-
-
-# ---------------------------------------------------------------------------
 # Model helpers
 # ---------------------------------------------------------------------------
 
 def build_model(device: str, use_mla: bool = True):
-    policy_cls = PI0PolicyMixedLayerAttention if use_mla else PI0Policy
-    label      = "PI0PolicyMixedLayerAttention" if use_mla else "PI0Policy (vanilla base)"
-    print(f"\n[build] Loading config from {MODEL_ID} ...")
-    print(f"[build] Policy class: {label}")
-    config_path = hf_hub_download(MODEL_ID, "config.json")
-    with open(config_path) as f:
-        config_dict = json.load(f)
+    """
+    Load policy via from_pretrained (handles weight loading cleanly),
+    then build pre/post processors the same way as the reference script.
+    For MLA, load base weights into PI0PolicyMixedLayerAttention instead.
+    """
+    label = "PI0PolicyMixedLayerAttention" if use_mla else "PI0Policy (vanilla base)"
+    print(f"\n[build] Loading {label} from {MODEL_ID} ...")
 
-    config_dict.pop("type", None)
-    config_dict["device"] = "cpu"
-    config_dict["dtype"]  = "bfloat16"
+    if use_mla:
+        # Load base PI0 first to get config + weights, then swap class
+        base = PI0Policy.from_pretrained(MODEL_ID)
+        policy = PI0PolicyMixedLayerAttention(base.config)
+        missing, unexpected = policy.load_state_dict(base.state_dict(), strict=False)
+        print(f"[build] MLA weight transfer — missing: {len(missing)}, unexpected: {len(unexpected)}")
+        del base
+        gc.collect()
+    else:
+        policy = PI0Policy.from_pretrained(MODEL_ID)
 
-    for key, val in config_dict.get("input_features", {}).items():
-        config_dict["input_features"][key] = PolicyFeature(
-            type=FeatureType[val["type"]], shape=tuple(val["shape"])
-        )
-    for key, val in config_dict.get("output_features", {}).items():
-        config_dict["output_features"][key] = PolicyFeature(
-            type=FeatureType[val["type"]], shape=tuple(val["shape"])
-        )
+    policy = policy.to(device).eval()
 
-    config = PI0Config(**config_dict)
-    print(f"[build] Constructing {label} on CPU ...")
-    policy = policy_cls(config)
+    # Use make_pre_post_processors for all normalization — matches reference script exactly
+    preprocess, postprocess = make_pre_post_processors(
+        policy.config,
+        MODEL_ID,
+        preprocessor_overrides={"device_processor": {"device": str(device)}},
+    )
 
-    print("[build] Loading pretrained weights ...")
-    weights_path = hf_hub_download(MODEL_ID, "model.safetensors")
-    state_dict   = load_file(weights_path, device="cpu")
-    remapped     = {
-        (k if k.startswith("model.") else f"model.{k}"): v
-        for k, v in state_dict.items()
-    }
-    missing, unexpected = policy.load_state_dict(remapped, strict=False)
-    print(f"[build] Pretrained — missing: {len(missing)}, unexpected: {len(unexpected)}")
-    del state_dict, remapped
-    gc.collect()
-
-    config.device = device
-    policy = policy.to(device)
     print(f"[build] Model on {device} | "
           f"GPU mem: {torch.cuda.memory_allocated()/1e9:.1f}GB")
-    return policy, config
+    return policy, policy.config, preprocess, postprocess
 
 
 def load_mla_checkpoint(policy, ckpt_path: str, device: str):
@@ -224,27 +146,38 @@ def save_progress(path: str, results: dict):
 
 
 # ---------------------------------------------------------------------------
-# Proprioceptive state
-# FIX 3+4: build exactly an 8-dim state vector from the correct keys
+# Proprioceptive state — build raw obs dict for preprocess()
 # ---------------------------------------------------------------------------
 
-def _build_state(obs: dict, state_dim: int, device) -> torch.Tensor:
+def _build_obs_dict(obs: dict, task_str: str) -> dict:
+    """
+    Convert a LIBERO env observation into the flat dict that preprocess() expects,
+    mirroring the keys used in LeRobotDataset frames.
+    """
+    # Build state vector: eef_pos(3) + eef_quat(4) + gripper_qpos(1) = 8
     parts = []
     for key in _PROPRIO_KEYS:
-        if key in obs:
-            parts.append(obs[key].astype(np.float32).flatten())
-        else:
+        if key not in obs:
             raise KeyError(
-                f"Expected proprioceptive key '{key}' not found in obs. "
-                f"Available keys: {list(obs.keys())}"
+                f"Expected key '{key}' not in obs. Available: {list(obs.keys())}"
             )
-    vec = np.concatenate(parts)
-    if vec.shape[0] != state_dim:
+        parts.append(obs[key].astype(np.float32).flatten())
+    state = np.concatenate(parts)
+    if state.shape[0] != STATE_DIM:
         raise ValueError(
-            f"State vector has {vec.shape[0]} dims but STATE_DIM={state_dim}. "
-            f"Check _PROPRIO_KEYS matches training data."
+            f"State has {state.shape[0]} dims, expected {STATE_DIM}. "
+            f"Check _PROPRIO_KEYS."
         )
-    return torch.from_numpy(vec).unsqueeze(0).to(device)
+
+    return {
+        # Images: HWC uint8 numpy → preprocess will handle normalization + resize
+        "observation.images.image":  obs["agentview_image"],
+        "observation.images.image2": obs["robot0_eye_in_hand_image"],
+        # State: raw numpy, preprocess will normalize
+        "observation.state": state,
+        # Language: raw string, preprocess will tokenize
+        "observation.language_instruction": task_str,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -252,38 +185,25 @@ def _build_state(obs: dict, state_dim: int, device) -> torch.Tensor:
 # ---------------------------------------------------------------------------
 
 def run_episode(
-    policy, env, lang_tokens, device, config,
-    max_steps: int, norm_stats: dict
+    policy, env, task_str, device, config,
+    preprocess, postprocess,
+    max_steps: int,
 ) -> tuple[bool, int]:
     obs         = env.reset()
     ep_success  = False
     steps_taken = 0
 
     while steps_taken < max_steps:
-        # Build raw state and normalise it (FIX 5)
-        raw_state = _build_state(obs, STATE_DIM, device)
-        norm_state = normalize_state(raw_state, norm_stats)
+        # Build raw obs dict and preprocess — handles normalization, tokenization,
+        # image transforms, and device placement, exactly like the reference script
+        raw_obs = _build_obs_dict(obs, task_str)
+        batch   = preprocess(raw_obs)
 
-        obs_tensor = {
-            # FIX 2: images must be CAMERA_RESOLUTION (256) to match config [3,256,256]
-            "observation.images.image": torch.from_numpy(
-                obs["agentview_image"].transpose(2, 0, 1)[None]
-            ).float().to(device) / 255.0,
+        with torch.inference_mode():
+            action = policy.select_action(batch)
 
-            "observation.images.image2": torch.from_numpy(
-                obs["robot0_eye_in_hand_image"].transpose(2, 0, 1)[None]
-            ).float().to(device) / 255.0,
-
-            "observation.state": norm_state,
-
-            **lang_tokens,
-        }
-
-        with torch.no_grad():
-            action = policy.select_action(obs_tensor)
-
-        # FIX 5: denormalise action back to robot's native units before stepping
-        action = denormalize_action(action, norm_stats)
+        # postprocess undoes normalization on the action (unnormalize, detokenize etc.)
+        action    = postprocess(action)
         action_np = action.cpu().numpy().flatten()
 
         obs, _reward, done, info = env.step(action_np)
@@ -296,9 +216,9 @@ def run_episode(
 
 
 def run_suite(
-    policy, config, tokenizer, suite, num_episodes,
-    device, seed, progress_path, resume,
-    norm_stats: dict,
+    policy, config, preprocess, postprocess,
+    suite, num_episodes, device, seed,
+    progress_path, resume,
     model_label="model", num_tasks=10,
 ):
     try:
@@ -307,7 +227,7 @@ def run_suite(
     except ImportError:
         raise ImportError("LIBERO not installed. pip install -e path/to/LIBERO")
 
-    max_steps = SUITE_MAX_STEPS[suite]
+    max_steps  = SUITE_MAX_STEPS[suite]
     benchmark  = libero_benchmark.get_benchmark_dict()[suite]()
     task_names = benchmark.get_task_names()[:num_tasks]
 
@@ -327,14 +247,12 @@ def run_suite(
                   f"(SR={sr*100:.0f}%)")
             continue
 
-        task             = benchmark.get_task(task_idx)
-        task_description = task.language
-        lang_tokens      = tokenize_task(task_description, tokenizer, config, device)
+        task         = benchmark.get_task(task_idx)
+        task_str     = task.language
 
         try:
             env = OffScreenRenderEnv(
                 bddl_file_name=benchmark.get_task_bddl_file_path(task_idx),
-                # FIX 2: match the model's expected image resolution
                 camera_heights=CAMERA_RESOLUTION,
                 camera_widths=CAMERA_RESOLUTION,
             )
@@ -357,8 +275,8 @@ def run_suite(
                 policy.reset()
             try:
                 success, steps = run_episode(
-                    policy, env, lang_tokens, device, config,
-                    max_steps, norm_stats
+                    policy, env, task_str, device, config,
+                    preprocess, postprocess, max_steps,
                 )
                 successes.append(float(success))
                 steps_list.append(steps)
@@ -409,31 +327,27 @@ def run_suite(
 # Dry run
 # ---------------------------------------------------------------------------
 
-def dry_run(policy, config, device):
-    print("\n[dry-run] Sanity forward pass ...")
-    B      = 1
-    T_lang = config.tokenizer_max_length
-    chunk  = config.chunk_size
+def dry_run(policy, config, preprocess, postprocess, device):
+    print("\n[dry-run] Sanity check via preprocess + select_action ...")
 
-    state_dim = STATE_DIM
-    print(f"[dry-run] state_dim={state_dim}")
+    # Build a fake obs dict with the right shapes
+    fake_obs = {
+        "observation.images.image":  np.random.randint(
+            0, 255, (CAMERA_RESOLUTION, CAMERA_RESOLUTION, 3), dtype=np.uint8),
+        "observation.images.image2": np.random.randint(
+            0, 255, (CAMERA_RESOLUTION, CAMERA_RESOLUTION, 3), dtype=np.uint8),
+        "observation.state": np.zeros(STATE_DIM, dtype=np.float32),
+        "observation.language_instruction": "pick up the red block",
+    }
 
-    with torch.no_grad():
-        loss = policy.model(
-            images      = torch.randn(B, 1, 3, CAMERA_RESOLUTION, CAMERA_RESOLUTION,
-                                      device=device, dtype=torch.bfloat16),
-            img_masks   = torch.ones(B, 1, dtype=torch.bool, device=device),
-            lang_tokens = torch.randint(0, 256_000, (B, T_lang), device=device),
-            lang_masks  = torch.ones(B, T_lang, dtype=torch.bool, device=device),
-            state       = torch.randn(B, state_dim,
-                                      device=device, dtype=torch.float32),
-            actions     = torch.randn(B, chunk, state_dim,
-                                      device=device, dtype=torch.float32),
-            noise       = torch.randn(B, chunk, state_dim,
-                                      device=device, dtype=torch.float32),
-            time        = torch.rand(B, device=device, dtype=torch.float32),
-        )
-    print(f"[dry-run] Forward OK — loss mean: {loss.mean().item():.4f}")
+    batch = preprocess(fake_obs)
+
+    with torch.inference_mode():
+        action = policy.select_action(batch)
+
+    action = postprocess(action)
+    print(f"[dry-run] action shape: {action.shape}  mean: {action.mean().item():.4f}")
+
     if hasattr(policy.model, "mla"):
         weights = policy.model.mla.get_layer_weights()
         print(f"[dry-run] MLA weights layer 17: "
@@ -451,7 +365,8 @@ def _fmt(val: float) -> str:
     return f"{val*100:5.1f}%"
 
 
-def print_comparison_table(all_results, args, elapsed, ckpt_label="MLA (ours)", base_results=None):
+def print_comparison_table(all_results, args, elapsed,
+                           ckpt_label="MLA (ours)", base_results=None):
     suites = args.suites
     col_w  = 14
 
@@ -590,17 +505,14 @@ def main():
 
     print_timing_estimate(args, step_time_s=args.step_time)
 
-    # FIX 5: load normalisation stats once, share across all suite runs
-    norm_stats = load_norm_stats(MODEL_ID)
-
-    tokenizer = make_tokenizer()
-
     base_results = None
     if args.compare_base:
-        base_policy, config = build_model(args.device, use_mla=False)
+        base_policy, config, preprocess, postprocess = build_model(
+            args.device, use_mla=False
+        )
 
         if args.dry_run:
-            dry_run(base_policy, config, args.device)
+            dry_run(base_policy, config, preprocess, postprocess, args.device)
             return
 
         base_results = {}
@@ -613,10 +525,11 @@ def main():
         for suite in args.suites:
             progress_path = os.path.join(output_dir, f"base__{suite}.json")
             result = run_suite(
-                policy=base_policy, config=config, tokenizer=tokenizer,
+                policy=base_policy, config=config,
+                preprocess=preprocess, postprocess=postprocess,
                 suite=suite, num_episodes=args.num_episodes,
-                device=args.device, seed=args.seed, progress_path=progress_path,
-                resume=args.resume, norm_stats=norm_stats,
+                device=args.device, seed=args.seed,
+                progress_path=progress_path, resume=args.resume,
                 model_label="Base PI0", num_tasks=args.num_tasks,
             )
             base_results[suite] = result
@@ -633,11 +546,11 @@ def main():
         print(f"[mem] After base cleanup: "
               f"{torch.cuda.memory_allocated()/1e9:.1f}GB allocated")
 
-    policy, config = build_model(args.device, use_mla=True)
+    policy, config, preprocess, postprocess = build_model(args.device, use_mla=True)
     load_mla_checkpoint(policy, args.checkpoint, args.device)
 
     if args.dry_run and not args.compare_base:
-        dry_run(policy, config, args.device)
+        dry_run(policy, config, preprocess, postprocess, args.device)
         return
 
     all_results = {}
@@ -651,10 +564,11 @@ def main():
     for suite in args.suites:
         progress_path = os.path.join(output_dir, f"mla__{suite}.json")
         result = run_suite(
-            policy=policy, config=config, tokenizer=tokenizer,
+            policy=policy, config=config,
+            preprocess=preprocess, postprocess=postprocess,
             suite=suite, num_episodes=args.num_episodes,
-            device=args.device, seed=args.seed, progress_path=progress_path,
-            resume=args.resume, norm_stats=norm_stats,
+            device=args.device, seed=args.seed,
+            progress_path=progress_path, resume=args.resume,
             model_label=args.ckpt_label, num_tasks=args.num_tasks,
         )
         all_results[suite] = result
