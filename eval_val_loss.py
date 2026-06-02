@@ -31,7 +31,7 @@ from pi0_policy_mixed_layer_attention import PI0PolicyMixedLayerAttention
 
 # ── Config ───────────────────────────────────────────────────────────────────
 
-MODEL_ID     = "lerobot/pi0_libero_base"
+MODEL_ID     = "lerobot/pi0_libero_finetuned_v044"
 DEVICE       = "cuda"
 VAL_BATCHES  = 100   # ~10 min on T4, increase for more reliable estimate
 BATCH_SIZE   = 2
