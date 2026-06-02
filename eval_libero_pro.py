@@ -18,13 +18,16 @@ from safetensors.torch import load_file
 from transformers import AutoTokenizer
 
 from lerobot.configs.types import FeatureType, PolicyFeature
+from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.policies.pi0 import PI0Config, PI0Policy
 from pi0_policy_mixed_layer_attention import PI0PolicyMixedLayerAttention
 
 import sys
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "LIBERO-PRO"))
 
-MODEL_ID = "lerobot/pi0_libero_base"
+# FIX 1: use the finetuned checkpoint — base was never trained to solve LIBERO tasks
+MODEL_ID = "lerobot/pi0_libero_finetuned"
+
 NUM_EPISODES = 1
 
 ALL_SUITES = ["libero_goal", "libero_spatial", "libero_10", "libero_object"]
@@ -92,6 +95,69 @@ OFFICIAL_BASELINES = {
     },
 }
 
+# ---------------------------------------------------------------------------
+# FIX 2: correct image resolution (config input_features shape is [3,256,256])
+# ---------------------------------------------------------------------------
+CAMERA_RESOLUTION = 256
+
+# ---------------------------------------------------------------------------
+# FIX 3: correct state dim — observation.state shape in config is [8], not 32
+# ---------------------------------------------------------------------------
+STATE_DIM: int = 8
+
+# FIX 4: correct proprioceptive keys that sum to exactly 8 dimensions.
+# eef_pos=3, eef_quat=4, gripper_qpos=1 → 8 total.
+# These match what lerobot/pi0_libero_finetuned was trained on.
+_PROPRIO_KEYS = [
+    "robot0_eef_pos",       # 3-dim
+    "robot0_eef_quat",      # 4-dim
+    "robot0_gripper_qpos",  # 1-dim
+]
+
+
+# ---------------------------------------------------------------------------
+# FIX 5: normalization helpers
+# Load dataset norm stats once at startup and use them every step.
+# Without this, state is in raw units and actions are in normalised space —
+# both silently produce wrong behaviour.
+# ---------------------------------------------------------------------------
+
+def load_norm_stats(model_id: str) -> dict:
+    """Load mean/std normalisation statistics from the LeRobot dataset metadata."""
+    print(f"[norm] Loading normalisation stats from dataset: {model_id}")
+    dataset = LeRobotDataset(model_id)
+    stats = dataset.meta.stats  # dict: key -> {"mean": tensor, "std": tensor}
+    print(f"[norm] Stats loaded for keys: {list(stats.keys())}")
+    return stats
+
+
+def normalize_state(state_tensor: torch.Tensor, stats: dict) -> torch.Tensor:
+    """Z-score normalise state using dataset statistics."""
+    key = "observation.state"
+    if key not in stats:
+        return state_tensor
+    mean = torch.tensor(stats[key]["mean"], dtype=state_tensor.dtype,
+                        device=state_tensor.device)
+    std  = torch.tensor(stats[key]["std"],  dtype=state_tensor.dtype,
+                        device=state_tensor.device)
+    return (state_tensor - mean) / (std + 1e-8)
+
+
+def denormalize_action(action_tensor: torch.Tensor, stats: dict) -> torch.Tensor:
+    """Undo z-score normalisation on predicted actions."""
+    key = "action"
+    if key not in stats:
+        return action_tensor
+    mean = torch.tensor(stats[key]["mean"], dtype=action_tensor.dtype,
+                        device=action_tensor.device)
+    std  = torch.tensor(stats[key]["std"],  dtype=action_tensor.dtype,
+                        device=action_tensor.device)
+    return action_tensor * std + mean
+
+
+# ---------------------------------------------------------------------------
+# Model helpers
+# ---------------------------------------------------------------------------
 
 def build_model(device: str, use_mla: bool = True):
     policy_cls = PI0PolicyMixedLayerAttention if use_mla else PI0Policy
@@ -217,61 +283,70 @@ def ensure_perturbed_suite(suite, perturbation, bddl_base, init_base):
     return perturbed_suite
 
 
-STATE_DIM: int = 32
-
-_PROPRIO_KEYS = [
-    "robot0_joint_pos_cos",
-    "robot0_joint_pos_sin",
-    "robot0_joint_vel",
-    "robot0_gripper_qpos",
-    "robot0_eef_pos",
-    "robot0_eef_quat",
-    "robot0_gripper_qvel",
-    "robot0_eef_vel",
-]
-
+# ---------------------------------------------------------------------------
+# Proprioceptive state
+# FIX 3+4: build exactly an 8-dim state vector from the correct keys
+# ---------------------------------------------------------------------------
 
 def _build_state(obs: dict, state_dim: int, device) -> torch.Tensor:
     parts = []
     for key in _PROPRIO_KEYS:
         if key in obs:
             parts.append(obs[key].astype(np.float32).flatten())
-    if not parts:
-        raise KeyError(
-            f"None of the expected proprioceptive keys found in obs. "
-            f"Available keys: {list(obs.keys())}"
-        )
+        else:
+            raise KeyError(
+                f"Expected proprioceptive key '{key}' not found in obs. "
+                f"Available keys: {list(obs.keys())}"
+            )
     vec = np.concatenate(parts)
-    if vec.shape[0] >= state_dim:
-        vec = vec[:state_dim]
-    else:
-        vec = np.pad(vec, (0, state_dim - vec.shape[0]))
+    if vec.shape[0] != state_dim:
+        raise ValueError(
+            f"State vector has {vec.shape[0]} dims but STATE_DIM={state_dim}. "
+            f"Check _PROPRIO_KEYS matches training data."
+        )
     return torch.from_numpy(vec).unsqueeze(0).to(device)
 
 
-def run_episode(policy, env, lang_tokens, device, config, max_steps: int) -> tuple[bool, int]:
-    obs        = env.reset()
-    ep_success = False
+# ---------------------------------------------------------------------------
+# Episode runner
+# FIX 2+5: correct camera resolution, normalize state, denormalize action
+# ---------------------------------------------------------------------------
+
+def run_episode(
+    policy, env, lang_tokens, device, config,
+    max_steps: int, norm_stats: dict,
+) -> tuple[bool, int]:
+    obs         = env.reset()
+    ep_success  = False
     steps_taken = 0
 
     while steps_taken < max_steps:
+        # Build raw state and normalise it (FIX 5)
+        raw_state  = _build_state(obs, STATE_DIM, device)
+        norm_state = normalize_state(raw_state, norm_stats)
+
         obs_tensor = {
+            # FIX 2: images must be CAMERA_RESOLUTION (256) to match config [3,256,256]
             "observation.images.image": torch.from_numpy(
                 obs["agentview_image"].transpose(2, 0, 1)[None]
             ).float().to(device) / 255.0,
-        
+
             "observation.images.image2": torch.from_numpy(
-                obs["robot0_eye_in_hand_image"].transpose(2, 0, 1)[None]  # ← was agentview_image
+                obs["robot0_eye_in_hand_image"].transpose(2, 0, 1)[None]
             ).float().to(device) / 255.0,
-        
-            "observation.state": _build_state(obs, STATE_DIM, device),
+
+            "observation.state": norm_state,
+
             **lang_tokens,
         }
 
         with torch.no_grad():
             action = policy.select_action(obs_tensor)
 
-        action_np = action.cpu().numpy().flatten()  # always (action_dim,)
+        # FIX 5: denormalise action back to robot's native units before stepping
+        action    = denormalize_action(action, norm_stats)
+        action_np = action.cpu().numpy().flatten()
+
         obs, _reward, done, info = env.step(action_np)
         steps_taken += 1
         ep_success = ep_success or bool(info.get("success", False))
@@ -284,6 +359,7 @@ def run_episode(policy, env, lang_tokens, device, config, max_steps: int) -> tup
 def run_combo(
     policy, config, tokenizer, suite, perturbation, num_episodes,
     device, seed, progress_path, resume, bddl_base, init_base,
+    norm_stats: dict,
     model_label="model", num_tasks=10,
 ):
     try:
@@ -299,7 +375,8 @@ def run_combo(
     task_names = benchmark.get_task_names()[:num_tasks]
 
     print(f"\n[eval:{model_label}] {suite} × {perturbation} | "
-          f"{len(task_names)}/{benchmark.get_num_tasks()} tasks × {num_episodes} ep | max_steps={max_steps}")
+          f"{len(task_names)}/{benchmark.get_num_tasks()} tasks × {num_episodes} ep | "
+          f"max_steps={max_steps} | cam_res={CAMERA_RESOLUTION} | state_dim={STATE_DIM}")
 
     results = load_progress(progress_path) if resume else {}
     policy.eval()
@@ -321,8 +398,9 @@ def run_combo(
             env = OffScreenRenderEnv(
                 bddl_file_name=benchmark.get_task_bddl_file_path(task_idx),
                 camera_names=["agentview", "robot0_eye_in_hand"],
-                camera_heights=224,
-                camera_widths=224,
+                # FIX 2: match the model's expected image resolution
+                camera_heights=CAMERA_RESOLUTION,
+                camera_widths=CAMERA_RESOLUTION,
             )
             env.seed(seed)
         except Exception as e:
@@ -343,7 +421,8 @@ def run_combo(
                 policy.reset()
             try:
                 success, steps = run_episode(
-                    policy, env, lang_tokens, device, config, max_steps
+                    policy, env, lang_tokens, device, config,
+                    max_steps, norm_stats,
                 )
                 successes.append(float(success))
                 steps_list.append(steps)
@@ -392,27 +471,31 @@ def run_combo(
     return results
 
 
+# ---------------------------------------------------------------------------
+# Dry run
+# FIX 2+3: use CAMERA_RESOLUTION and STATE_DIM constants (not state_proj.weight)
+# ---------------------------------------------------------------------------
+
 def dry_run(policy, config, device):
     print("\n[dry-run] Sanity forward pass ...")
     B      = 1
     T_lang = config.tokenizer_max_length
     chunk  = config.chunk_size
 
-    state_dim = policy.model.state_proj.weight.shape[1]
-    print(f"[dry-run] state_dim={state_dim} (from state_proj.weight)")
+    print(f"[dry-run] state_dim={STATE_DIM}")
 
     with torch.no_grad():
         loss = policy.model(
-            images      = torch.randn(B, 1, 3, 224, 224,
+            images      = torch.randn(B, 1, 3, CAMERA_RESOLUTION, CAMERA_RESOLUTION,
                                       device=device, dtype=torch.bfloat16),
             img_masks   = torch.ones(B, 1, dtype=torch.bool, device=device),
             lang_tokens = torch.randint(0, 256_000, (B, T_lang), device=device),
             lang_masks  = torch.ones(B, T_lang, dtype=torch.bool, device=device),
-            state       = torch.randn(B, state_dim,
+            state       = torch.randn(B, STATE_DIM,
                                       device=device, dtype=torch.float32),
-            actions     = torch.randn(B, chunk, state_dim,
+            actions     = torch.randn(B, chunk, STATE_DIM,
                                       device=device, dtype=torch.float32),
-            noise       = torch.randn(B, chunk, state_dim,
+            noise       = torch.randn(B, chunk, STATE_DIM,
                                       device=device, dtype=torch.float32),
             time        = torch.rand(B, device=device, dtype=torch.float32),
         )
@@ -423,6 +506,10 @@ def dry_run(policy, config, device):
               f"{[round(x, 3) for x in weights[-1].tolist()]}")
     print("[dry-run] All good.\n")
 
+
+# ---------------------------------------------------------------------------
+# Reporting
+# ---------------------------------------------------------------------------
 
 def _fmt(val: float) -> str:
     if val != val:
@@ -600,6 +687,10 @@ def print_timing_estimate(args, step_time_s: float = 4.5):
     print(f"  Tip: --suites libero_goal --perturbations position for a quick smoke-test.\n")
 
 
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
 def parse_args():
     p = argparse.ArgumentParser(
         description="LIBERO-PRO eval — MLA vs base PI0  (4 suites × 5 perturbations, 1 ep)"
@@ -623,9 +714,12 @@ def parse_args():
     return p.parse_args()
 
 
-def main():
-    global STATE_DIM
+# ---------------------------------------------------------------------------
+# Main
+# FIX: load norm stats once; remove dynamic STATE_DIM mutation via state_proj
+# ---------------------------------------------------------------------------
 
+def main():
     args = parse_args()
 
     if args.timing_only:
@@ -648,17 +742,19 @@ def main():
     print(f"[setup] {len(combos)} suite×perturbation combos | "
           f"{total_rollouts} rollouts per model | "
           f"{total_rollouts * multiplier} total rollouts")
+    print(f"[setup] Camera resolution: {CAMERA_RESOLUTION}x{CAMERA_RESOLUTION}")
+    print(f"[setup] State dim: {STATE_DIM}")
 
     print_timing_estimate(args, step_time_s=args.step_time)
+
+    # FIX 5: load normalisation stats once, share across all combo runs
+    norm_stats = load_norm_stats(MODEL_ID)
 
     tokenizer = make_tokenizer()
 
     base_results = None
     if args.compare_base:
         base_policy, config = build_model(args.device, use_mla=False)
-
-        STATE_DIM = base_policy.model.state_proj.weight.shape[1]
-        print(f"[setup] state_dim={STATE_DIM} (from state_proj.weight)")
 
         if args.dry_run:
             dry_run(base_policy, config, args.device)
@@ -679,6 +775,7 @@ def main():
                 suite=suite, perturbation=perturbation, num_episodes=args.num_episodes,
                 device=args.device, seed=args.seed, progress_path=progress_path,
                 resume=args.resume, bddl_base=args.bddl_base, init_base=args.init_base,
+                norm_stats=norm_stats,
                 model_label="Base PI0", num_tasks=args.num_tasks,
             )
             base_results[key] = result
@@ -697,9 +794,6 @@ def main():
 
     policy, config = build_model(args.device, use_mla=True)
     load_mla_checkpoint(policy, args.checkpoint, args.device)
-
-    STATE_DIM = policy.model.state_proj.weight.shape[1]
-    print(f"[setup] state_dim={STATE_DIM} (from state_proj.weight)")
 
     if args.dry_run and not args.compare_base:
         dry_run(policy, config, args.device)
@@ -722,6 +816,7 @@ def main():
             suite=suite, perturbation=perturbation, num_episodes=args.num_episodes,
             device=args.device, seed=args.seed, progress_path=progress_path,
             resume=args.resume, bddl_base=args.bddl_base, init_base=args.init_base,
+            norm_stats=norm_stats,
             model_label=args.ckpt_label, num_tasks=args.num_tasks,
         )
         all_results[key] = result
