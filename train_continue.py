@@ -32,8 +32,8 @@ WARMUP_STEPS  = 0           # set > 0 if you want a fresh warmup after resume
 
 OUTPUT_DIR    = "./outputs/mixed_layer_attention_continued"
 MODEL_ID      = "lerobot/pi0_libero_finetuned_v044"      # base architecture weights
-RESUME_CKPT   = "./outputs/mixed_layer_attention/checkpoint_006000/model.pt"
-RESUME_STEP   = 6000      # step counter offset for logging/saving
+RESUME_CKPT   = "./outputs/mixed_layer_attention/checkpoint_010000/model.pt"
+RESUME_STEP   = 10000      # step counter offset for logging/saving
 
 # ── Config ─────────────────────────────────────────────────────────────────
 
