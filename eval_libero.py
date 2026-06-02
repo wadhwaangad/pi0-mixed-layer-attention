@@ -172,10 +172,10 @@ def _build_obs_dict(obs: dict, task_str: str) -> dict:
         )
 
     return {
-        "observation.images.image":  obs["agentview_image"].transpose(2, 0, 1),  # HWC -> CHW
-        "observation.images.image2": obs["robot0_eye_in_hand_image"].transpose(2, 0, 1),
-        "observation.images.empty_camera_0": np.zeros((3, 224, 224), dtype=np.uint8),
-        "observation.state": state,
+        "observation.images.image":          obs["agentview_image"].transpose(2, 0, 1)[None],
+        "observation.images.image2":         obs["robot0_eye_in_hand_image"].transpose(2, 0, 1)[None],
+        "observation.images.empty_camera_0": np.zeros((1, 3, 224, 224), dtype=np.uint8),
+        "observation.state": state[None],  # also needs batch dim
         "task": task_str,
     }
 
@@ -198,11 +198,6 @@ def run_episode(
         # image transforms, and device placement, exactly like the reference script
         raw_obs = _build_obs_dict(obs, task_str)
         batch   = preprocess(raw_obs)
-        print(raw_obs)
-        for k, v in batch.items():
-            if hasattr(v, 'shape'):
-                print(f"  {k}: {v.shape}")
-        raise SystemExit
 
         with torch.inference_mode():
             action = policy.select_action(batch)
