@@ -76,10 +76,11 @@ def build_model(device: str, use_mla: bool = True):
 
     if use_mla:
         # Load base PI0 first to get config + weights, then swap class
-        base = PI0Policy.from_pretrained(MODEL_ID)
-        policy = PI0PolicyMixedLayerAttention(base.config)
-        missing, unexpected = policy.load_state_dict(base.state_dict(), strict=False)
-        print(f"[build] MLA weight transfer — missing: {len(missing)}, unexpected: {len(unexpected)}")
+        base = PI0Policy.from_pretrained(MODEL_ID)  # loads CPU by default
+        config = base.config
+        config.device = "cpu"  # prevent MLA __init__ from moving to GPU
+        policy = PI0PolicyMixedLayerAttention(config)
+        policy.load_state_dict(base.state_dict(), strict=False)
         del base
         gc.collect()
     else:
