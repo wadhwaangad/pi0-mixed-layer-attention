@@ -4,6 +4,13 @@ eval_libero.py — Full LIBERO standard benchmark evaluation for PI0 + MixedLaye
 Evaluates on the 4 standard LIBERO suites (libero_goal, libero_spatial, libero_10,
 libero_object) without any perturbations. Mirrors eval_libero_pro.py in structure,
 output format, and CLI interface.
+
+FIXES applied vs original:
+  1. MODEL_ID changed to lerobot/pi0_libero_finetuned (base was never trained on tasks)
+  2. Camera resolution changed to 256x256 (config shows [3,256,256], not 224)
+  3. STATE_DIM set to 8 to match observation.state shape [8] in config
+  4. _PROPRIO_KEYS corrected to exactly the 8-dim state used during training
+  5. Normalization stats loaded from dataset and applied to state + actions
 """
 
 import argparse
@@ -20,10 +27,13 @@ from safetensors.torch import load_file
 from transformers import AutoTokenizer
 
 from lerobot.configs.types import FeatureType, PolicyFeature
+from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.policies.pi0 import PI0Config, PI0Policy
 from pi0_policy_mixed_layer_attention import PI0PolicyMixedLayerAttention
 
-MODEL_ID = "lerobot/pi0_libero_base"
+# FIX 1: use the finetuned checkpoint — base was never trained to solve LIBERO tasks
+MODEL_ID = "lerobot/pi0_libero_finetuned_v044"
+
 NUM_EPISODES = 1
 
 ALL_SUITES = ["libero_goal", "libero_spatial", "libero_10", "libero_object"]
@@ -56,6 +66,66 @@ OFFICIAL_BASELINES = {
         "libero_object":  float("nan"),
     },
 }
+
+
+# ---------------------------------------------------------------------------
+# FIX 2: correct image resolution (config input_features shape is [3,256,256])
+# ---------------------------------------------------------------------------
+CAMERA_RESOLUTION = 256
+
+# ---------------------------------------------------------------------------
+# FIX 3: correct state dim — observation.state shape in config is [8], not 32
+# ---------------------------------------------------------------------------
+STATE_DIM: int = 8
+
+# FIX 4: correct proprioceptive keys that sum to exactly 8 dimensions.
+# eef_pos=3, eef_quat=4, gripper_qpos=1 → 8 total.
+# These match what lerobot/pi0_libero_finetuned was trained on.
+_PROPRIO_KEYS = [
+    "robot0_eef_pos",       # 3-dim
+    "robot0_eef_quat",      # 4-dim
+    "robot0_gripper_qpos",  # 1-dim
+]
+
+
+# ---------------------------------------------------------------------------
+# FIX 5: normalization helpers
+# Load dataset norm stats once at startup and use them every step.
+# Without this, state is in raw units and actions are in normalised space —
+# both silently produce wrong behaviour.
+# ---------------------------------------------------------------------------
+
+def load_norm_stats(model_id: str) -> dict:
+    """Load mean/std normalisation statistics from the LeRobot dataset metadata."""
+    print(f"[norm] Loading normalisation stats from dataset: {model_id}")
+    dataset = LeRobotDataset(model_id)
+    stats = dataset.meta.stats  # dict: key -> {"mean": tensor, "std": tensor}
+    print(f"[norm] Stats loaded for keys: {list(stats.keys())}")
+    return stats
+
+
+def normalize_state(state_tensor: torch.Tensor, stats: dict) -> torch.Tensor:
+    """Z-score normalise state using dataset statistics."""
+    key = "observation.state"
+    if key not in stats:
+        return state_tensor  # no stats available, pass through
+    mean = torch.tensor(stats[key]["mean"], dtype=state_tensor.dtype,
+                        device=state_tensor.device)
+    std  = torch.tensor(stats[key]["std"],  dtype=state_tensor.dtype,
+                        device=state_tensor.device)
+    return (state_tensor - mean) / (std + 1e-8)
+
+
+def denormalize_action(action_tensor: torch.Tensor, stats: dict) -> torch.Tensor:
+    """Undo z-score normalisation on predicted actions."""
+    key = "action"
+    if key not in stats:
+        return action_tensor  # no stats available, pass through
+    mean = torch.tensor(stats[key]["mean"], dtype=action_tensor.dtype,
+                        device=action_tensor.device)
+    std  = torch.tensor(stats[key]["std"],  dtype=action_tensor.dtype,
+                        device=action_tensor.device)
+    return action_tensor * std + mean
 
 
 # ---------------------------------------------------------------------------
@@ -155,37 +225,25 @@ def save_progress(path: str, results: dict):
 
 # ---------------------------------------------------------------------------
 # Proprioceptive state
+# FIX 3+4: build exactly an 8-dim state vector from the correct keys
 # ---------------------------------------------------------------------------
-
-STATE_DIM: int = 32
-
-_PROPRIO_KEYS = [
-    "robot0_joint_pos_cos",
-    "robot0_joint_pos_sin",
-    "robot0_joint_vel",
-    "robot0_gripper_qpos",
-    "robot0_eef_pos",
-    "robot0_eef_quat",
-    "robot0_gripper_qvel",
-    "robot0_eef_vel",
-]
-
 
 def _build_state(obs: dict, state_dim: int, device) -> torch.Tensor:
     parts = []
     for key in _PROPRIO_KEYS:
         if key in obs:
             parts.append(obs[key].astype(np.float32).flatten())
-    if not parts:
-        raise KeyError(
-            f"None of the expected proprioceptive keys found in obs. "
-            f"Available keys: {list(obs.keys())}"
-        )
+        else:
+            raise KeyError(
+                f"Expected proprioceptive key '{key}' not found in obs. "
+                f"Available keys: {list(obs.keys())}"
+            )
     vec = np.concatenate(parts)
-    if vec.shape[0] >= state_dim:
-        vec = vec[:state_dim]
-    else:
-        vec = np.pad(vec, (0, state_dim - vec.shape[0]))
+    if vec.shape[0] != state_dim:
+        raise ValueError(
+            f"State vector has {vec.shape[0]} dims but STATE_DIM={state_dim}. "
+            f"Check _PROPRIO_KEYS matches training data."
+        )
     return torch.from_numpy(vec).unsqueeze(0).to(device)
 
 
@@ -193,13 +251,21 @@ def _build_state(obs: dict, state_dim: int, device) -> torch.Tensor:
 # Episode / suite runners
 # ---------------------------------------------------------------------------
 
-def run_episode(policy, env, lang_tokens, device, config, max_steps: int) -> tuple[bool, int]:
+def run_episode(
+    policy, env, lang_tokens, device, config,
+    max_steps: int, norm_stats: dict
+) -> tuple[bool, int]:
     obs         = env.reset()
     ep_success  = False
     steps_taken = 0
 
     while steps_taken < max_steps:
+        # Build raw state and normalise it (FIX 5)
+        raw_state = _build_state(obs, STATE_DIM, device)
+        norm_state = normalize_state(raw_state, norm_stats)
+
         obs_tensor = {
+            # FIX 2: images must be CAMERA_RESOLUTION (256) to match config [3,256,256]
             "observation.images.image": torch.from_numpy(
                 obs["agentview_image"].transpose(2, 0, 1)[None]
             ).float().to(device) / 255.0,
@@ -208,7 +274,7 @@ def run_episode(policy, env, lang_tokens, device, config, max_steps: int) -> tup
                 obs["robot0_eye_in_hand_image"].transpose(2, 0, 1)[None]
             ).float().to(device) / 255.0,
 
-            "observation.state": _build_state(obs, STATE_DIM, device),
+            "observation.state": norm_state,
 
             **lang_tokens,
         }
@@ -216,7 +282,10 @@ def run_episode(policy, env, lang_tokens, device, config, max_steps: int) -> tup
         with torch.no_grad():
             action = policy.select_action(obs_tensor)
 
+        # FIX 5: denormalise action back to robot's native units before stepping
+        action = denormalize_action(action, norm_stats)
         action_np = action.cpu().numpy().flatten()
+
         obs, _reward, done, info = env.step(action_np)
         steps_taken += 1
         ep_success = ep_success or bool(info.get("success", False))
@@ -229,6 +298,7 @@ def run_episode(policy, env, lang_tokens, device, config, max_steps: int) -> tup
 def run_suite(
     policy, config, tokenizer, suite, num_episodes,
     device, seed, progress_path, resume,
+    norm_stats: dict,
     model_label="model", num_tasks=10,
 ):
     try:
@@ -243,7 +313,7 @@ def run_suite(
 
     print(f"\n[eval:{model_label}] {suite} | "
           f"{len(task_names)}/{benchmark.get_num_tasks()} tasks × {num_episodes} ep | "
-          f"max_steps={max_steps}")
+          f"max_steps={max_steps} | cam_res={CAMERA_RESOLUTION} | state_dim={STATE_DIM}")
 
     results = load_progress(progress_path) if resume else {}
     policy.eval()
@@ -264,8 +334,9 @@ def run_suite(
         try:
             env = OffScreenRenderEnv(
                 bddl_file_name=benchmark.get_task_bddl_file_path(task_idx),
-                camera_heights=224,
-                camera_widths=224,
+                # FIX 2: match the model's expected image resolution
+                camera_heights=CAMERA_RESOLUTION,
+                camera_widths=CAMERA_RESOLUTION,
             )
             env.seed(seed)
         except Exception as e:
@@ -286,7 +357,8 @@ def run_suite(
                 policy.reset()
             try:
                 success, steps = run_episode(
-                    policy, env, lang_tokens, device, config, max_steps
+                    policy, env, lang_tokens, device, config,
+                    max_steps, norm_stats
                 )
                 successes.append(float(success))
                 steps_list.append(steps)
@@ -343,12 +415,12 @@ def dry_run(policy, config, device):
     T_lang = config.tokenizer_max_length
     chunk  = config.chunk_size
 
-    state_dim = policy.model.state_proj.weight.shape[1]
-    print(f"[dry-run] state_dim={state_dim} (from state_proj.weight)")
+    state_dim = STATE_DIM
+    print(f"[dry-run] state_dim={state_dim}")
 
     with torch.no_grad():
         loss = policy.model(
-            images      = torch.randn(B, 1, 3, 224, 224,
+            images      = torch.randn(B, 1, 3, CAMERA_RESOLUTION, CAMERA_RESOLUTION,
                                       device=device, dtype=torch.bfloat16),
             img_masks   = torch.ones(B, 1, dtype=torch.bool, device=device),
             lang_tokens = torch.randint(0, 256_000, (B, T_lang), device=device),
@@ -496,8 +568,6 @@ def parse_args():
 # ---------------------------------------------------------------------------
 
 def main():
-    global STATE_DIM
-
     args = parse_args()
 
     if args.timing_only:
@@ -515,17 +585,19 @@ def main():
     print(f"[setup] {len(args.suites)} suites | "
           f"{total_rollouts} rollouts per model | "
           f"{total_rollouts * multiplier} total rollouts")
+    print(f"[setup] Camera resolution: {CAMERA_RESOLUTION}x{CAMERA_RESOLUTION}")
+    print(f"[setup] State dim: {STATE_DIM}")
 
     print_timing_estimate(args, step_time_s=args.step_time)
+
+    # FIX 5: load normalisation stats once, share across all suite runs
+    norm_stats = load_norm_stats(MODEL_ID)
 
     tokenizer = make_tokenizer()
 
     base_results = None
     if args.compare_base:
         base_policy, config = build_model(args.device, use_mla=False)
-
-        STATE_DIM = base_policy.model.state_proj.weight.shape[1]
-        print(f"[setup] state_dim={STATE_DIM} (from state_proj.weight)")
 
         if args.dry_run:
             dry_run(base_policy, config, args.device)
@@ -544,7 +616,8 @@ def main():
                 policy=base_policy, config=config, tokenizer=tokenizer,
                 suite=suite, num_episodes=args.num_episodes,
                 device=args.device, seed=args.seed, progress_path=progress_path,
-                resume=args.resume, model_label="Base PI0", num_tasks=args.num_tasks,
+                resume=args.resume, norm_stats=norm_stats,
+                model_label="Base PI0", num_tasks=args.num_tasks,
             )
             base_results[suite] = result
 
@@ -562,9 +635,6 @@ def main():
 
     policy, config = build_model(args.device, use_mla=True)
     load_mla_checkpoint(policy, args.checkpoint, args.device)
-
-    STATE_DIM = policy.model.state_proj.weight.shape[1]
-    print(f"[setup] state_dim={STATE_DIM} (from state_proj.weight)")
 
     if args.dry_run and not args.compare_base:
         dry_run(policy, config, args.device)
@@ -584,7 +654,8 @@ def main():
             policy=policy, config=config, tokenizer=tokenizer,
             suite=suite, num_episodes=args.num_episodes,
             device=args.device, seed=args.seed, progress_path=progress_path,
-            resume=args.resume, model_label=args.ckpt_label, num_tasks=args.num_tasks,
+            resume=args.resume, norm_stats=norm_stats,
+            model_label=args.ckpt_label, num_tasks=args.num_tasks,
         )
         all_results[suite] = result
 
