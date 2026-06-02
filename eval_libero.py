@@ -23,24 +23,6 @@ from lerobot.configs.types import FeatureType, PolicyFeature
 from lerobot.policies.pi0 import PI0Config, PI0Policy
 from pi0_policy_mixed_layer_attention import PI0PolicyMixedLayerAttention
 
-# ---------------------------------------------------------------------------
-# Normalization stats from lerobot/libero dataset (MEAN_STD mode)
-# ---------------------------------------------------------------------------
-
-ACTION_MEAN = torch.tensor([0.06278156570450202, 0.08684081017968912, -0.09037305936952836,
-                             0.0005407430783705139, 0.0056433796450358715, -0.005229098518603562,
-                             -0.04964072167678376])
-ACTION_STD  = torch.tensor([0.33552371813523185, 0.37844699137610033, 0.4447286014970994,
-                             0.03924354055831819, 0.06339296374013795, 0.07797027468104202,
-                             0.9987671387144731])
-
-STATE_MEAN  = torch.tensor([-0.04651878279191748, 0.034409066787269356, 0.7645525031210381,
-                             2.9722094975655056, -0.22046978549041713, -0.1255794031738752,
-                             0.026914253269017054, -0.027190783616938205])
-STATE_STD   = torch.tensor([0.10494395406007467, 0.1517661931590825, 0.37851673399636293,
-                             0.34427372827294567, 0.9069468525211363, 0.3253919057050403,
-                             0.014175902732343454, 0.014058894645014064])
-
 MODEL_ID = "lerobot/pi0_libero_base"
 NUM_EPISODES = 1
 
@@ -175,14 +157,37 @@ def save_progress(path: str, results: dict):
 # Proprioceptive state
 # ---------------------------------------------------------------------------
 
-def build_state(obs, device):
-    """
-    Use canonical LIBERO state if available.
-    This is what PI0 is trained on.
-    """
-    state = obs["state"]  
-    state = torch.from_numpy(state.astype(np.float32))
-    return state.unsqueeze(0).to(device)
+STATE_DIM: int = 32
+
+_PROPRIO_KEYS = [
+    "robot0_joint_pos_cos",
+    "robot0_joint_pos_sin",
+    "robot0_joint_vel",
+    "robot0_gripper_qpos",
+    "robot0_eef_pos",
+    "robot0_eef_quat",
+    "robot0_gripper_qvel",
+    "robot0_eef_vel",
+]
+
+
+def _build_state(obs: dict, state_dim: int, device) -> torch.Tensor:
+    parts = []
+    for key in _PROPRIO_KEYS:
+        if key in obs:
+            parts.append(obs[key].astype(np.float32).flatten())
+    if not parts:
+        raise KeyError(
+            f"None of the expected proprioceptive keys found in obs. "
+            f"Available keys: {list(obs.keys())}"
+        )
+    vec = np.concatenate(parts)
+    if vec.shape[0] >= state_dim:
+        vec = vec[:state_dim]
+    else:
+        vec = np.pad(vec, (0, state_dim - vec.shape[0]))
+    return torch.from_numpy(vec).unsqueeze(0).to(device)
+
 
 # ---------------------------------------------------------------------------
 # Episode / suite runners
@@ -203,7 +208,7 @@ def run_episode(policy, env, lang_tokens, device, config, max_steps: int) -> tup
                 obs["robot0_eye_in_hand_image"].transpose(2, 0, 1)[None]
             ).float().to(device) / 255.0,
 
-            "observation.state": _build_state(obs, device),
+            "observation.state": _build_state(obs, STATE_DIM, device),
 
             **lang_tokens,
         }
@@ -211,11 +216,7 @@ def run_episode(policy, env, lang_tokens, device, config, max_steps: int) -> tup
         with torch.no_grad():
             action = policy.select_action(obs_tensor)
 
-        action_np = action.cpu()
-        # unnormalize from model space back to real action space (MEAN_STD)
-        n         = action_np.shape[-1]
-        action_np = action_np * ACTION_STD[:n] + ACTION_MEAN[:n]
-        action_np = action_np.numpy().flatten()
+        action_np = action.cpu().numpy().flatten()
         obs, _reward, done, info = env.step(action_np)
         steps_taken += 1
         ep_success = ep_success or bool(info.get("success", False))
