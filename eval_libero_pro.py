@@ -1,10 +1,11 @@
 """
 eval_libero_pro.py — Full LIBERO-PRO evaluation for PI0 + MixedLayerAttention.
-[... truncated header ...]
+Observation construction and normalization match eval_libero.py exactly
+(make_pre_post_processors + _build_obs_dict pipeline).
+Only the perturbation and suite logic differs.
 """
 
 import argparse
-import copy
 import gc
 import json
 import os
@@ -13,20 +14,15 @@ from pathlib import Path
 
 import numpy as np
 import torch
-from huggingface_hub import hf_hub_download
-from safetensors.torch import load_file
-from transformers import AutoTokenizer
-
-from lerobot.configs.types import FeatureType, PolicyFeature
-from lerobot.datasets.lerobot_dataset import LeRobotDataset
-from lerobot.policies.pi0 import PI0Config, PI0Policy
-from pi0_policy_mixed_layer_attention import PI0PolicyMixedLayerAttention
 from scipy.spatial.transform import Rotation as R
+
+from lerobot.policies.factory import make_pre_post_processors
+from lerobot.policies.pi0 import PI0Policy
+from pi0_policy_mixed_layer_attention import PI0PolicyMixedLayerAttention
 
 import sys
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "LIBERO-PRO"))
 
-# FIX 1: use the finetuned checkpoint — base was never trained to solve LIBERO tasks
 MODEL_ID = "lerobot/pi0_libero_finetuned_v044"
 
 NUM_EPISODES = 1
@@ -96,19 +92,9 @@ OFFICIAL_BASELINES = {
     },
 }
 
-# ---------------------------------------------------------------------------
-# FIX 2: correct image resolution (config input_features shape is [3,256,256])
-# ---------------------------------------------------------------------------
-CAMERA_RESOLUTION = 256
+CAMERA_RESOLUTION = 224
+STATE_DIM: int    = 8
 
-# ---------------------------------------------------------------------------
-# FIX 3: correct state dim — observation.state shape in config is [8], not 32
-# ---------------------------------------------------------------------------
-STATE_DIM: int = 8
-
-# FIX 4: correct proprioceptive keys that sum to exactly 8 dimensions.
-# eef_pos=3, eef_quat=4, gripper_qpos=1 → 8 total.
-# These match what lerobot/pi0_libero_finetuned was trained on.
 _PROPRIO_KEYS = [
     "robot0_eef_pos",       # 3-dim
     "robot0_eef_quat",      # 4-dim
@@ -117,92 +103,39 @@ _PROPRIO_KEYS = [
 
 
 # ---------------------------------------------------------------------------
-# FIX 5: normalization helpers
-# Load dataset norm stats once at startup and use them every step.
-# Without this, state is in raw units and actions are in normalised space —
-# both silently produce wrong behaviour.
-# ---------------------------------------------------------------------------
-
-def load_norm_stats(model_id: str) -> dict:
-    """Load mean/std normalisation statistics from the LeRobot dataset metadata."""
-    print(f"[norm] Loading normalisation stats from dataset: {model_id}")
-    dataset = LeRobotDataset(model_id)
-    stats = dataset.meta.stats  # dict: key -> {"mean": tensor, "std": tensor}
-    print(f"[norm] Stats loaded for keys: {list(stats.keys())}")
-    return stats
-
-
-def normalize_state(state_tensor: torch.Tensor, stats: dict) -> torch.Tensor:
-    """Z-score normalise state using dataset statistics."""
-    key = "observation.state"
-    if key not in stats:
-        return state_tensor
-    mean = torch.tensor(stats[key]["mean"], dtype=state_tensor.dtype,
-                        device=state_tensor.device)
-    std  = torch.tensor(stats[key]["std"],  dtype=state_tensor.dtype,
-                        device=state_tensor.device)
-    return (state_tensor - mean) / (std + 1e-8)
-
-
-def denormalize_action(action_tensor: torch.Tensor, stats: dict) -> torch.Tensor:
-    """Undo z-score normalisation on predicted actions."""
-    key = "action"
-    if key not in stats:
-        return action_tensor
-    mean = torch.tensor(stats[key]["mean"], dtype=action_tensor.dtype,
-                        device=action_tensor.device)
-    std  = torch.tensor(stats[key]["std"],  dtype=action_tensor.dtype,
-                        device=action_tensor.device)
-    return action_tensor * std + mean
-
-
-# ---------------------------------------------------------------------------
-# Model helpers
+# Model helpers — identical to eval_libero.py
 # ---------------------------------------------------------------------------
 
 def build_model(device: str, use_mla: bool = True):
-    policy_cls = PI0PolicyMixedLayerAttention if use_mla else PI0Policy
-    label      = "PI0PolicyMixedLayerAttention" if use_mla else "PI0Policy (vanilla base)"
-    print(f"\n[build] Loading config from {MODEL_ID} ...")
-    print(f"[build] Policy class: {label}")
-    config_path = hf_hub_download(MODEL_ID, "config.json")
-    with open(config_path) as f:
-        config_dict = json.load(f)
+    """
+    Load policy via from_pretrained (handles weight loading cleanly),
+    then build pre/post processors the same way as the reference script.
+    For MLA, load base weights into PI0PolicyMixedLayerAttention instead.
+    """
+    label = "PI0PolicyMixedLayerAttention" if use_mla else "PI0Policy (vanilla base)"
+    print(f"\n[build] Loading {label} from {MODEL_ID} ...")
 
-    config_dict.pop("type", None)
-    config_dict["device"] = "cpu"
-    config_dict["dtype"]  = "bfloat16"
+    if use_mla:
+        base = PI0Policy.from_pretrained(MODEL_ID)
+        policy = PI0PolicyMixedLayerAttention(base.config)
+        missing, unexpected = policy.load_state_dict(base.state_dict(), strict=False)
+        print(f"[build] MLA weight transfer — missing: {len(missing)}, unexpected: {len(unexpected)}")
+        del base
+        gc.collect()
+    else:
+        policy = PI0Policy.from_pretrained(MODEL_ID)
 
-    for key, val in config_dict.get("input_features", {}).items():
-        config_dict["input_features"][key] = PolicyFeature(
-            type=FeatureType[val["type"]], shape=tuple(val["shape"])
-        )
-    for key, val in config_dict.get("output_features", {}).items():
-        config_dict["output_features"][key] = PolicyFeature(
-            type=FeatureType[val["type"]], shape=tuple(val["shape"])
-        )
+    policy = policy.to(device).eval()
 
-    config = PI0Config(**config_dict)
-    print(f"[build] Constructing {label} on CPU ...")
-    policy = policy_cls(config)
+    preprocess, postprocess = make_pre_post_processors(
+        policy.config,
+        MODEL_ID,
+        preprocessor_overrides={"device_processor": {"device": str(device)}},
+    )
 
-    print("[build] Loading pretrained weights ...")
-    weights_path = hf_hub_download(MODEL_ID, "model.safetensors")
-    state_dict   = load_file(weights_path, device="cpu")
-    remapped     = {
-        (k if k.startswith("model.") else f"model.{k}"): v
-        for k, v in state_dict.items()
-    }
-    missing, unexpected = policy.load_state_dict(remapped, strict=False)
-    print(f"[build] Pretrained — missing: {len(missing)}, unexpected: {len(unexpected)}")
-    del state_dict, remapped
-    gc.collect()
-
-    config.device = device
-    policy = policy.to(device)
     print(f"[build] Model on {device} | "
           f"GPU mem: {torch.cuda.memory_allocated()/1e9:.1f}GB")
-    return policy, config
+    return policy, policy.config, preprocess, postprocess
 
 
 def load_mla_checkpoint(policy, ckpt_path: str, device: str):
@@ -214,23 +147,9 @@ def load_mla_checkpoint(policy, ckpt_path: str, device: str):
     return policy
 
 
-def make_tokenizer():
-    return AutoTokenizer.from_pretrained("google/paligemma-3b-pt-224")
-
-
-def tokenize_task(task_str, tokenizer, config, device):
-    tokens = tokenizer(
-        [task_str + "\n"],
-        return_tensors="pt",
-        padding="max_length",
-        max_length=config.tokenizer_max_length,
-        truncation=True,
-    ).to(device)
-    return {
-        "observation.language.tokens":         tokens["input_ids"],
-        "observation.language.attention_mask": tokens["attention_mask"].bool(),
-    }
-
+# ---------------------------------------------------------------------------
+# Progress helpers — identical to eval_libero.py
+# ---------------------------------------------------------------------------
 
 def load_progress(path: str) -> dict:
     if os.path.exists(path):
@@ -246,6 +165,43 @@ def save_progress(path: str, results: dict):
     with open(path, "w") as f:
         json.dump(results, f, indent=2)
 
+
+# ---------------------------------------------------------------------------
+# Obs construction — identical to eval_libero.py
+# ---------------------------------------------------------------------------
+
+def _build_obs_dict(obs: dict, task_str: str) -> dict:
+    """
+    Convert a LIBERO env observation into the flat dict that preprocess() expects,
+    mirroring the keys used in LeRobotDataset frames.
+    """
+    eef_pos = obs["robot0_eef_pos"].astype(np.float32)
+
+    eef_rotvec = R.from_quat(
+        obs["robot0_eef_quat"]
+    ).as_rotvec().astype(np.float32)
+
+    gripper = obs["robot0_gripper_qpos"].astype(np.float32)
+
+    state = np.concatenate([eef_pos, eef_rotvec, gripper])
+    if state.shape[0] != STATE_DIM:
+        raise ValueError(
+            f"State has {state.shape[0]} dims, expected {STATE_DIM}. "
+            f"Check _PROPRIO_KEYS."
+        )
+
+    return {
+        "observation.images.image":  obs["agentview_image"],
+        "observation.images.image2": obs["robot0_eye_in_hand_image"],
+        "observation.images.empty_camera_0": np.zeros((224, 224, 3), dtype=np.uint8),
+        "observation.state": state,
+        "observation.language_instruction": task_str,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Perturbation suite setup — LIBERO-PRO specific
+# ---------------------------------------------------------------------------
 
 def ensure_perturbed_suite(suite, perturbation, bddl_base, init_base):
     try:
@@ -285,63 +241,26 @@ def ensure_perturbed_suite(suite, perturbation, bddl_base, init_base):
 
 
 # ---------------------------------------------------------------------------
-# Proprioceptive state
-# FIX 3+4: build exactly an 8-dim state vector from the correct keys
-# ---------------------------------------------------------------------------
-
-def _build_state(obs: dict, state_dim: int, device) -> torch.Tensor:
-    eef_pos = obs["robot0_eef_pos"].astype(np.float32)
-    eef_rotvec = R.from_quat(
-        obs["robot0_eef_quat"]
-    ).as_rotvec().astype(np.float32)
-    gripper = obs["robot0_gripper_qpos"].astype(np.float32)
-    vec = np.concatenate([eef_pos, eef_rotvec, gripper])
-    if vec.shape[0] != state_dim:
-        raise ValueError(
-            f"State vector has {vec.shape[0]} dims but STATE_DIM={state_dim}. "
-            f"Check _PROPRIO_KEYS matches training data."
-        )
-    return torch.from_numpy(vec).unsqueeze(0).to(device)
-
-
-# ---------------------------------------------------------------------------
-# Episode runner
-# FIX 2+5: correct camera resolution, normalize state, denormalize action
+# Episode runner — identical to eval_libero.py
 # ---------------------------------------------------------------------------
 
 def run_episode(
-    policy, env, lang_tokens, device, config,
-    max_steps: int, norm_stats: dict,
+    policy, env, task_str, device, config,
+    preprocess, postprocess,
+    max_steps: int,
 ) -> tuple[bool, int]:
     obs         = env.reset()
     ep_success  = False
     steps_taken = 0
 
     while steps_taken < max_steps:
-        # Build raw state and normalise it (FIX 5)
-        raw_state  = _build_state(obs, STATE_DIM, device)
-        norm_state = normalize_state(raw_state, norm_stats)
+        raw_obs = _build_obs_dict(obs, task_str)
+        batch   = preprocess(raw_obs)
 
-        obs_tensor = {
-            # FIX 2: images must be CAMERA_RESOLUTION (256) to match config [3,256,256]
-            "observation.images.image": torch.from_numpy(
-                obs["agentview_image"].transpose(2, 0, 1)[None]
-            ).float().to(device) / 255.0,
+        with torch.inference_mode():
+            action = policy.select_action(batch)
 
-            "observation.images.image2": torch.from_numpy(
-                obs["robot0_eye_in_hand_image"].transpose(2, 0, 1)[None]
-            ).float().to(device) / 255.0,
-
-            "observation.state": norm_state,
-
-            **lang_tokens,
-        }
-
-        with torch.no_grad():
-            action = policy.select_action(obs_tensor)
-
-        # FIX 5: denormalise action back to robot's native units before stepping
-        action    = denormalize_action(action, norm_stats)
+        action    = postprocess(action)
         action_np = action.cpu().numpy().flatten()
 
         obs, _reward, done, info = env.step(action_np)
@@ -353,10 +272,15 @@ def run_episode(
     return ep_success, steps_taken
 
 
+# ---------------------------------------------------------------------------
+# Combo runner — run_suite from eval_libero.py extended with perturbation logic
+# ---------------------------------------------------------------------------
+
 def run_combo(
-    policy, config, tokenizer, suite, perturbation, num_episodes,
-    device, seed, progress_path, resume, bddl_base, init_base,
-    norm_stats: dict,
+    policy, config, preprocess, postprocess,
+    suite, perturbation, num_episodes,
+    device, seed, progress_path, resume,
+    bddl_base, init_base,
     model_label="model", num_tasks=10,
 ):
     try:
@@ -365,7 +289,7 @@ def run_combo(
     except ImportError:
         raise ImportError("LIBERO not installed. Follow LIBERO-PRO setup instructions.")
 
-    max_steps = SUITE_MAX_STEPS[suite]
+    max_steps       = SUITE_MAX_STEPS[suite]
     perturbed_suite = ensure_perturbed_suite(suite, perturbation, bddl_base, init_base)
 
     benchmark  = libero_benchmark.get_benchmark_dict()[perturbed_suite]()
@@ -387,15 +311,13 @@ def run_combo(
                   f"(SR={sr*100:.0f}%)")
             continue
 
-        task             = benchmark.get_task(task_idx)
-        task_description = task.language
-        lang_tokens      = tokenize_task(task_description, tokenizer, config, device)
+        task     = benchmark.get_task(task_idx)
+        task_str = task.language
 
         try:
             env = OffScreenRenderEnv(
                 bddl_file_name=benchmark.get_task_bddl_file_path(task_idx),
                 camera_names=["agentview", "robot0_eye_in_hand"],
-                # FIX 2: match the model's expected image resolution
                 camera_heights=CAMERA_RESOLUTION,
                 camera_widths=CAMERA_RESOLUTION,
             )
@@ -418,8 +340,8 @@ def run_combo(
                 policy.reset()
             try:
                 success, steps = run_episode(
-                    policy, env, lang_tokens, device, config,
-                    max_steps, norm_stats,
+                    policy, env, task_str, device, config,
+                    preprocess, postprocess, max_steps,
                 )
                 successes.append(float(success))
                 steps_list.append(steps)
@@ -469,34 +391,29 @@ def run_combo(
 
 
 # ---------------------------------------------------------------------------
-# Dry run
-# FIX 2+3: use CAMERA_RESOLUTION and STATE_DIM constants (not state_proj.weight)
+# Dry run — identical to eval_libero.py
 # ---------------------------------------------------------------------------
 
-def dry_run(policy, config, device):
-    print("\n[dry-run] Sanity forward pass ...")
-    B      = 1
-    T_lang = config.tokenizer_max_length
-    chunk  = config.chunk_size
+def dry_run(policy, config, preprocess, postprocess, device):
+    print("\n[dry-run] Sanity check via preprocess + select_action ...")
 
-    print(f"[dry-run] state_dim={STATE_DIM}")
+    fake_obs = {
+        "observation.images.image":  np.random.randint(
+            0, 255, (CAMERA_RESOLUTION, CAMERA_RESOLUTION, 3), dtype=np.uint8),
+        "observation.images.image2": np.random.randint(
+            0, 255, (CAMERA_RESOLUTION, CAMERA_RESOLUTION, 3), dtype=np.uint8),
+        "observation.state": np.zeros(STATE_DIM, dtype=np.float32),
+        "observation.language_instruction": "pick up the red block",
+    }
 
-    with torch.no_grad():
-        loss = policy.model(
-            images      = torch.randn(B, 1, 3, CAMERA_RESOLUTION, CAMERA_RESOLUTION,
-                                      device=device, dtype=torch.bfloat16),
-            img_masks   = torch.ones(B, 1, dtype=torch.bool, device=device),
-            lang_tokens = torch.randint(0, 256_000, (B, T_lang), device=device),
-            lang_masks  = torch.ones(B, T_lang, dtype=torch.bool, device=device),
-            state       = torch.randn(B, STATE_DIM,
-                                      device=device, dtype=torch.float32),
-            actions     = torch.randn(B, chunk, STATE_DIM,
-                                      device=device, dtype=torch.float32),
-            noise       = torch.randn(B, chunk, STATE_DIM,
-                                      device=device, dtype=torch.float32),
-            time        = torch.rand(B, device=device, dtype=torch.float32),
-        )
-    print(f"[dry-run] Forward OK — loss mean: {loss.mean().item():.4f}")
+    batch = preprocess(fake_obs)
+
+    with torch.inference_mode():
+        action = policy.select_action(batch)
+
+    action = postprocess(action)
+    print(f"[dry-run] action shape: {action.shape}  mean: {action.mean().item():.4f}")
+
     if hasattr(policy.model, "mla"):
         weights = policy.model.mla.get_layer_weights()
         print(f"[dry-run] MLA weights layer 17: "
@@ -505,7 +422,7 @@ def dry_run(policy, config, device):
 
 
 # ---------------------------------------------------------------------------
-# Reporting
+# Reporting — LIBERO-PRO specific (perturbation table)
 # ---------------------------------------------------------------------------
 
 def _fmt(val: float) -> str:
@@ -536,7 +453,7 @@ def print_comparison_table(all_results, args, elapsed, ckpt_label="MLA (ours)", 
             )
         ]
 
-        extra_cols = (["Base PI0"] if base_results is not None else []) + [ckpt_label]
+        extra_cols       = (["Base PI0"] if base_results is not None else []) + [ckpt_label]
         all_model_labels = active_baselines + extra_cols
 
         print(f"\n── Perturbation: {pert.upper()} ──")
@@ -616,8 +533,8 @@ def print_comparison_table(all_results, args, elapsed, ckpt_label="MLA (ours)", 
         row      = f"  {suite:<16}"
         pert_srs = []
         for pert in perturbations:
-            key    = f"{suite}__{pert}"
-            sr     = (
+            key = f"{suite}__{pert}"
+            sr  = (
                 all_results.get(key, {})
                 .get("__overall__", {})
                 .get("success_rate", float("nan"))
@@ -639,9 +556,9 @@ def print_comparison_table(all_results, args, elapsed, ckpt_label="MLA (ours)", 
             else:
                 row += f"{_fmt(sr):>{col_w2}}"
 
-        suite_avg = float(np.nanmean(pert_srs)) if pert_srs else float("nan")
-        suite_avgs[suite] = suite_avg
-        row += f"{_fmt(suite_avg):>{col_w2}}"
+        suite_avg          = float(np.nanmean(pert_srs)) if pert_srs else float("nan")
+        suite_avgs[suite]  = suite_avg
+        row               += f"{_fmt(suite_avg):>{col_w2}}"
         print(row)
 
     print("  " + "-" * (len(header2) - 2))
@@ -655,7 +572,7 @@ def print_comparison_table(all_results, args, elapsed, ckpt_label="MLA (ours)", 
         ]
         pa = float(np.nanmean([v for v in srs if not np.isnan(v)])) if srs else float("nan")
         avg_row2 += f"{_fmt(pa):>{col_w2}}"
-    overall = float(np.nanmean(list(suite_avgs.values())))
+    overall   = float(np.nanmean(list(suite_avgs.values())))
     avg_row2 += f"{_fmt(overall):>{col_w2}}"
     print(avg_row2)
     print("=" * 90)
@@ -665,7 +582,7 @@ def print_comparison_table(all_results, args, elapsed, ckpt_label="MLA (ours)", 
 def print_timing_estimate(args, step_time_s: float = 4.5):
     avg_max_steps = np.mean([SUITE_MAX_STEPS[s] for s in args.suites])
     num_combos    = len(args.suites) * len(args.perturbations)
-    total_eps     = num_combos * 10 * args.num_episodes
+    total_eps     = num_combos * args.num_tasks * args.num_episodes
 
     multiplier = 2 if getattr(args, "compare_base", False) else 1
     label      = " × 2 (base + MLA)" if multiplier == 2 else ""
@@ -675,7 +592,7 @@ def print_timing_estimate(args, step_time_s: float = 4.5):
     worst_case = total_eps * avg_max_steps * step_time_s / 3600 * multiplier
 
     print(f"\n[timing] Estimate for T4 @ {step_time_s}s/step "
-          f"({num_combos} combos × 10 tasks × {args.num_episodes} ep{label}):")
+          f"({num_combos} combos × {args.num_tasks} tasks × {args.num_episodes} ep{label}):")
     print(f"  Optimistic  (~50 avg steps/ep, fails fast): {optimistic:5.1f} h")
     print(f"  Realistic   (~100 avg steps/ep):            {realistic:5.1f} h")
     print(f"  Worst case  (full max_steps={avg_max_steps:.0f}):          {worst_case:5.1f} h")
@@ -690,30 +607,29 @@ def print_timing_estimate(args, step_time_s: float = 4.5):
 
 def parse_args():
     p = argparse.ArgumentParser(
-        description="LIBERO-PRO eval — MLA vs base PI0  (4 suites × 5 perturbations, 1 ep)"
+        description="LIBERO-PRO eval — MLA vs base PI0  (4 suites × 5 perturbations)"
     )
-    p.add_argument("--checkpoint", type=str, required=True)
-    p.add_argument("--suites", nargs="+", default=ALL_SUITES, choices=ALL_SUITES)
-    p.add_argument("--perturbations", nargs="+", default=ALL_PERTURBATIONS, choices=ALL_PERTURBATIONS)
-    p.add_argument("--num_episodes", type=int, default=NUM_EPISODES)
-    p.add_argument("--compare_base", action="store_true")
-    p.add_argument("--num_tasks", type=int, default=5)
-    p.add_argument("--device",     type=str, default="cuda")
-    p.add_argument("--seed",       type=int, default=42)
-    p.add_argument("--output_dir", type=str, default=None)
-    p.add_argument("--bddl_base",  type=str, default="./LIBERO-PRO/libero/libero/bddl_files")
-    p.add_argument("--init_base",  type=str, default="./LIBERO-PRO/libero/libero/init_files")
-    p.add_argument("--ckpt_label", type=str, default="MLA (ours)")
-    p.add_argument("--step_time",  type=float, default=4.5)
-    p.add_argument("--resume", action="store_true")
-    p.add_argument("--dry_run", action="store_true")
-    p.add_argument("--timing_only", action="store_true")
+    p.add_argument("--checkpoint",    type=str,   required=True)
+    p.add_argument("--suites",        nargs="+",  default=ALL_SUITES, choices=ALL_SUITES)
+    p.add_argument("--perturbations", nargs="+",  default=ALL_PERTURBATIONS, choices=ALL_PERTURBATIONS)
+    p.add_argument("--num_episodes",  type=int,   default=NUM_EPISODES)
+    p.add_argument("--num_tasks",     type=int,   default=5)
+    p.add_argument("--compare_base",  action="store_true")
+    p.add_argument("--device",        type=str,   default="cuda")
+    p.add_argument("--seed",          type=int,   default=42)
+    p.add_argument("--output_dir",    type=str,   default=None)
+    p.add_argument("--bddl_base",     type=str,   default="./LIBERO-PRO/libero/libero/bddl_files")
+    p.add_argument("--init_base",     type=str,   default="./LIBERO-PRO/libero/libero/init_files")
+    p.add_argument("--ckpt_label",    type=str,   default="MLA (ours)")
+    p.add_argument("--step_time",     type=float, default=4.5)
+    p.add_argument("--resume",        action="store_true")
+    p.add_argument("--dry_run",       action="store_true")
+    p.add_argument("--timing_only",   action="store_true")
     return p.parse_args()
 
 
 # ---------------------------------------------------------------------------
 # Main
-# FIX: load norm stats once; remove dynamic STATE_DIM mutation via state_proj
 # ---------------------------------------------------------------------------
 
 def main():
@@ -744,17 +660,14 @@ def main():
 
     print_timing_estimate(args, step_time_s=args.step_time)
 
-    # FIX 5: load normalisation stats once, share across all combo runs
-    norm_stats = load_norm_stats(MODEL_ID)
-
-    tokenizer = make_tokenizer()
-
     base_results = None
     if args.compare_base:
-        base_policy, config = build_model(args.device, use_mla=False)
+        base_policy, config, preprocess, postprocess = build_model(
+            args.device, use_mla=False
+        )
 
         if args.dry_run:
-            dry_run(base_policy, config, args.device)
+            dry_run(base_policy, config, preprocess, postprocess, args.device)
             return
 
         base_results = {}
@@ -768,11 +681,13 @@ def main():
             key           = f"{suite}__{perturbation}"
             progress_path = os.path.join(output_dir, f"base__{key}.json")
             result = run_combo(
-                policy=base_policy, config=config, tokenizer=tokenizer,
-                suite=suite, perturbation=perturbation, num_episodes=args.num_episodes,
-                device=args.device, seed=args.seed, progress_path=progress_path,
-                resume=args.resume, bddl_base=args.bddl_base, init_base=args.init_base,
-                norm_stats=norm_stats,
+                policy=base_policy, config=config,
+                preprocess=preprocess, postprocess=postprocess,
+                suite=suite, perturbation=perturbation,
+                num_episodes=args.num_episodes,
+                device=args.device, seed=args.seed,
+                progress_path=progress_path, resume=args.resume,
+                bddl_base=args.bddl_base, init_base=args.init_base,
                 model_label="Base PI0", num_tasks=args.num_tasks,
             )
             base_results[key] = result
@@ -789,11 +704,11 @@ def main():
         print(f"[mem] After base cleanup: "
               f"{torch.cuda.memory_allocated()/1e9:.1f}GB allocated")
 
-    policy, config = build_model(args.device, use_mla=True)
+    policy, config, preprocess, postprocess = build_model(args.device, use_mla=True)
     load_mla_checkpoint(policy, args.checkpoint, args.device)
 
     if args.dry_run and not args.compare_base:
-        dry_run(policy, config, args.device)
+        dry_run(policy, config, preprocess, postprocess, args.device)
         return
 
     all_results = {}
@@ -809,11 +724,13 @@ def main():
         progress_path = os.path.join(output_dir, f"mla__{key}.json")
 
         result = run_combo(
-            policy=policy, config=config, tokenizer=tokenizer,
-            suite=suite, perturbation=perturbation, num_episodes=args.num_episodes,
-            device=args.device, seed=args.seed, progress_path=progress_path,
-            resume=args.resume, bddl_base=args.bddl_base, init_base=args.init_base,
-            norm_stats=norm_stats,
+            policy=policy, config=config,
+            preprocess=preprocess, postprocess=postprocess,
+            suite=suite, perturbation=perturbation,
+            num_episodes=args.num_episodes,
+            device=args.device, seed=args.seed,
+            progress_path=progress_path, resume=args.resume,
+            bddl_base=args.bddl_base, init_base=args.init_base,
             model_label=args.ckpt_label, num_tasks=args.num_tasks,
         )
         all_results[key] = result
