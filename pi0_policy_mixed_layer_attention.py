@@ -374,7 +374,8 @@ class PI0PolicyMixedLayerAttention(PI0Policy):
         import gc
         import torch
         MODEL_ID = "lerobot/pi0_libero_finetuned_v044"
-        device = "cuda" if torch.cuda.is_available() else "cpu"
+        device = "cuda" 
+        print(f"from_pretrained called on cls={cls}") 
     
         # Step 1: load base in bfloat16 — avoids the float32 → bf16 copy bloat
         from lerobot.policies.pi0 import PI0Policy
@@ -403,3 +404,11 @@ class PI0PolicyMixedLayerAttention(PI0Policy):
         torch.cuda.empty_cache()
     
         return policy
+        
+    def select_action(self, batch):
+        device = next(self.parameters()).device
+        batch = {
+            k: v.to(device) if isinstance(v, torch.Tensor) else v
+            for k, v in batch.items()
+        }
+        return super().select_action(batch)
