@@ -374,20 +374,20 @@ class PI0PolicyMixedLayerAttention(PI0Policy):
         import torch
         from safetensors.torch import load_file
         BASE_MODEL_ID = "lerobot/pi0_libero_finetuned_v044"
-        device = "cuda"
     
-        # Step 1: load base model properly so config is fully deserialized
+        # Step 1: load base on CPU
         from lerobot.policies.pi0 import PI0Policy
         base = PI0Policy.from_pretrained(BASE_MODEL_ID)
         config = base.config
-        config.device = device
+        config.device = "cpu"  # keep on CPU during construction to avoid OOM
     
-        # Step 2: build MLA policy with properly deserialized config
+        # Step 2: build MLA policy on CPU
         policy = cls(config)
         base_sd = {k.removeprefix("model."): v for k, v in base.state_dict().items()}
         policy.model.load_state_dict(base_sd, strict=False)
         del base, base_sd
         gc.collect()
+        torch.cuda.empty_cache()
     
         # Step 3: overlay MLA checkpoint
         mla_file = os.path.join(pretrained_model_name_or_path, "model.safetensors")
@@ -399,7 +399,7 @@ class PI0PolicyMixedLayerAttention(PI0Policy):
         del mla_ckpt
         gc.collect()
     
-        # Step 4: move to GPU
-        policy = policy.to(device=device, dtype=torch.bfloat16)
+        # Step 4: now move to GPU — base is already deleted so no OOM
+        policy = policy.to(device="cuda", dtype=torch.bfloat16)
         torch.cuda.empty_cache()
         return policy
