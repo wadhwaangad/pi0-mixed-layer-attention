@@ -73,6 +73,30 @@ class PI0PytorchMixedLayerAttention(PI0Pytorch):
         # new forward call. Hiddens are detached before caching so the backward
         # graph doesn't grow triangularly across layers.
         self._kv_cache: dict[int, tuple[Tensor, Tensor]] = {}
+    @classmethod
+    def from_pretrained(cls, pretrained_model_name_or_path, **kwargs):
+        import gc
+        MODEL_ID = "lerobot/pi0_libero_finetuned_v044"
+        
+        # Step 1: load base weights
+        from lerobot.policies.pi0 import PI0Policy
+        base = PI0Policy.from_pretrained(MODEL_ID)
+        config = base.config
+        config.device = "cpu"
+        
+        # Step 2: create MLA policy with base weights
+        policy = cls(config)
+        policy.load_state_dict(base.state_dict(), strict=False)
+        del base
+        gc.collect()
+        
+        # Step 3: overlay MLA checkpoint
+        import torch
+        ckpt = torch.load(pretrained_model_name_or_path, map_location="cpu", weights_only=True)
+        missing, unexpected = policy.model.load_state_dict(ckpt, strict=False)
+        print(f"[MLA] Missing: {len(missing)} Unexpected: {len(unexpected)}")
+        
+        return policy
 
     def _freeze_all(self):
         for param in self.parameters():
