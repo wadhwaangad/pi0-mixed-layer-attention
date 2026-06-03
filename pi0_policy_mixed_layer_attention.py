@@ -371,36 +371,38 @@ class PI0PolicyMixedLayerAttention(PI0Policy):
 
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path, **kwargs):
-        import gc
+        import gc, os, json
         import torch
-        MODEL_ID = "lerobot/pi0_libero_finetuned_v044"
-        device = "cuda" 
+        from safetensors.torch import load_file
+        BASE_MODEL_ID = "lerobot/pi0_libero_finetuned_v044"
+        device = "cuda"
     
-        # Step 1: load base in bfloat16 — avoids the float32 → bf16 copy bloat
+        # Step 1: load base
         from lerobot.policies.pi0 import PI0Policy
-        base = PI0Policy.from_pretrained(MODEL_ID, torch_dtype=torch.bfloat16)
+        base = PI0Policy.from_pretrained(BASE_MODEL_ID, torch_dtype=torch.bfloat16)
         config = base.config
         config.device = device
     
-        # Step 2: build MLA policy and copy weights while base is still on CPU
+        # Step 2: build MLA policy
         policy = cls(config)
-        # strict=False because MLA and LoRA keys won't be in base state dict
-        missing, unexpected = policy.model.load_state_dict(base.state_dict(), strict=False)
+        policy.model.load_state_dict(base.state_dict(), strict=False)
         del base
         gc.collect()
     
-        # Step 3: overlay your MLA checkpoint (still on CPU)
-        if pretrained_model_name_or_path:
-            ckpt = torch.load(
-                pretrained_model_name_or_path,
-                map_location="cpu",
-                weights_only=True,
-            )
-            policy.model.load_state_dict(ckpt, strict=False)
+        # Step 3: load MLA weights from safetensors
+        ckpt_file = os.path.join(pretrained_model_name_or_path, "model.safetensors")
+        print(f"Loading MLA weights from: {ckpt_file}")
+        ckpt = load_file(ckpt_file, device="cpu")
+        # strip "model." prefix — safetensors saves as "model.mla.gamma" etc.
+        ckpt = {k.removeprefix("model."): v for k, v in ckpt.items()}
+        missing, unexpected = policy.model.load_state_dict(ckpt, strict=False)
+        print(f"Missing: {len(missing)}, Unexpected: {len(unexpected)}")
+        if missing:
+            print("  Missing:", missing[:5], "...")
+        if unexpected:
+            print("  Unexpected:", unexpected[:5], "...")
     
-        # Step 4: move everything to GPU in one shot
+        # Step 4: move to GPU
         policy = policy.to(device=device, dtype=torch.bfloat16)
         torch.cuda.empty_cache()
-    
         return policy
-        
