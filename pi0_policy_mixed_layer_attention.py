@@ -404,10 +404,3 @@ class PI0PolicyMixedLayerAttention(PI0Policy):
     
         return policy
         
-    def select_action(self, batch):
-        device = next(self.parameters()).device
-        batch = {
-            k: v.to(device) if isinstance(v, torch.Tensor) else v
-            for k, v in batch.items()
-        }
-        return super().select_action(batch)
