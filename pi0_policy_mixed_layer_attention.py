@@ -368,41 +368,48 @@ class PI0PolicyMixedLayerAttention(PI0Policy):
     def __init__(self, config, **kwargs):
         super().__init__(config, **kwargs)
         self.model = PI0PytorchMixedLayerAttention(config)
-
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path, **kwargs):
-        import gc, os, json
+        import gc, os
         import torch
         from safetensors.torch import load_file
         BASE_MODEL_ID = "lerobot/pi0_libero_finetuned_v044"
         device = "cuda"
     
-        # Step 1: load base
-        from lerobot.policies.pi0 import PI0Policy
-        base = PI0Policy.from_pretrained(BASE_MODEL_ID, torch_dtype=torch.bfloat16)
-        config = base.config
-        config.device = device
+        # Step 1: load base config and weights directly, no PreTrainedConfig patching needed
+        from lerobot.policies.pi0.configuration_pi0 import PI0Config
+        from huggingface_hub import hf_hub_download
+        import json
+    
+        config_path = hf_hub_download(BASE_MODEL_ID, "config.json")
+        with open(config_path) as f:
+            cfg_dict = json.load(f)
+        cfg_dict.pop("type", None)
+        cfg_dict["device"] = device
+        config = PI0Config(**cfg_dict)
     
         # Step 2: build MLA policy
         policy = cls(config)
-        policy.model.load_state_dict(base.state_dict(), strict=False)
-        del base
+    
+        # Step 3: load base weights
+        weights_path = hf_hub_download(BASE_MODEL_ID, "model.safetensors")
+        base_ckpt = load_file(weights_path, device="cpu")
+        base_ckpt = {k.removeprefix("model."): v for k, v in base_ckpt.items()}
+        policy.model.load_state_dict(base_ckpt, strict=False)
+        del base_ckpt
         gc.collect()
     
-        # Step 3: load MLA weights from safetensors
-        ckpt_file = os.path.join(pretrained_model_name_or_path, "model.safetensors")
-        print(f"Loading MLA weights from: {ckpt_file}")
-        ckpt = load_file(ckpt_file, device="cpu")
-        # strip "model." prefix — safetensors saves as "model.mla.gamma" etc.
-        ckpt = {k.removeprefix("model."): v for k, v in ckpt.items()}
-        missing, unexpected = policy.model.load_state_dict(ckpt, strict=False)
-        print(f"Missing: {len(missing)}, Unexpected: {len(unexpected)}")
-        if missing:
-            print("  Missing:", missing[:5], "...")
-        if unexpected:
-            print("  Unexpected:", unexpected[:5], "...")
+        # Step 4: overlay MLA checkpoint
+        mla_file = os.path.join(pretrained_model_name_or_path, "model.safetensors")
+        print(f"[MLA] Loading MLA weights from: {mla_file}")
+        mla_ckpt = load_file(mla_file, device="cpu")
+        mla_ckpt = {k.removeprefix("model."): v for k, v in mla_ckpt.items()}
+        missing, unexpected = policy.model.load_state_dict(mla_ckpt, strict=False)
+        print(f"[MLA] Missing: {len(missing)}, Unexpected: {len(unexpected)}")
+        del mla_ckpt
+        gc.collect()
     
-        # Step 4: move to GPU
+        # Step 5: move to GPU
         policy = policy.to(device=device, dtype=torch.bfloat16)
         torch.cuda.empty_cache()
         return policy
