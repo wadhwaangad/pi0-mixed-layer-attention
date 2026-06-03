@@ -202,10 +202,12 @@ def run_episode(
         if 'observation.state' in batch:
             batch['observation.state'] = batch['observation.state'].to(torch.bfloat16)
         batch = {k: v.to(device) if hasattr(v, 'to') else v for k, v in batch.items()}
-        print(f"image mean: {batch['observation.images.image'].float().mean().item():.3f}")
-        print(f"state: {batch['observation.state'].float().cpu().numpy()}")
-        print(f"image dtype: {batch['observation.images.image'].dtype}")
-        print(f"state dtype: {batch['observation.state'].dtype}")
+        # Convert images to float [0,1] — _preprocess_images will then convert to [-1,1]
+        for key in ['observation.images.image', 'observation.images.image2', 'observation.images.empty_camera_0']:
+            if key in batch and batch[key].dtype == torch.uint8:
+                batch[key] = batch[key].float() / 255.0
+        if 'observation.state' in batch:
+            batch['observation.state'] = batch['observation.state'].to(torch.bfloat16)
         with torch.inference_mode():
             action = policy.select_action(batch)
 
