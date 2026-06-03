@@ -285,22 +285,13 @@ class PI0PytorchMixedLayerAttention(PI0Pytorch):
         # hold references into the full backward graph of earlier layers.
         paligemma_hiddens.append(outputs_embeds[0].detach())
         return outputs_embeds
-
+    
     def forward(
-        self, images, img_masks, lang_tokens, lang_masks,
-        state, actions, noise, time
-    ) -> Tensor:
+            self, images, img_masks, lang_tokens, lang_masks,
+            state, actions, noise, time
+        ) -> Tensor:
 
         self._kv_cache.clear()
-        device = next(self.parameters()).device
-        images = images.to(device)
-        img_masks = img_masks.to(device)
-        lang_tokens = lang_tokens.to(device)
-        lang_masks = lang_masks.to(device)
-        state = state.to(device, dtype=torch.bfloat16)
-        actions = actions.to(device, dtype=torch.bfloat16)
-        noise = noise.to(device, dtype=torch.bfloat16)
-        time = time.to(device, dtype=torch.bfloat16)
 
         time_expanded = time[:, None, None]
         x_t = time_expanded * noise + (1 - time_expanded) * actions
