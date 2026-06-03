@@ -292,7 +292,10 @@ class PI0PytorchMixedLayerAttention(PI0Pytorch):
         ) -> Tensor:
 
         self._kv_cache.clear()
-
+        if noise is None:
+            noise = self.sample_noise(actions.shape, actions.device)
+        if time is None:
+            time = self.sample_time(actions.shape[0], actions.device)
         time_expanded = time[:, None, None]
         x_t = time_expanded * noise + (1 - time_expanded) * actions
         u_t = noise - actions
