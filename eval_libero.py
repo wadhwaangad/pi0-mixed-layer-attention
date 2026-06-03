@@ -87,7 +87,6 @@ def build_model(device: str, use_mla: bool = True):
         policy = PI0Policy.from_pretrained(MODEL_ID)
 
     policy = policy.to(device).eval()
-    policy.model.to(torch.bfloat16)
     
 
     # Use make_pre_post_processors for all normalization — matches reference script exactly
