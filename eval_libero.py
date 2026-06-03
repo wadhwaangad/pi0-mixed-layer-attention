@@ -206,8 +206,10 @@ def run_episode(
         for key in ['observation.images.image', 'observation.images.image2', 'observation.images.empty_camera_0']:
             if key in batch and batch[key].dtype == torch.uint8:
                 batch[key] = batch[key].float() / 255.0
+            
         if 'observation.state' in batch:
             batch['observation.state'] = batch['observation.state'].to(torch.bfloat16)
+        print(f"img mean={batch['observation.images.image'].float().mean():.3f} min={batch['observation.images.image'].float().min():.3f} max={batch['observation.images.image'].float().max():.3f}")
         with torch.inference_mode():
             action = policy.select_action(batch)
 
