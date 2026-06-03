@@ -203,6 +203,8 @@ def run_episode(
         # image transforms, and device placement, exactly like the reference script
         raw_obs = _build_obs_dict(obs, task_str)
         batch   = preprocess(raw_obs)
+        if 'observation.state' in batch:
+            batch['observation.state'] = batch['observation.state'].to(torch.bfloat16)
         batch = {k: v.to(device) if hasattr(v, 'to') else v for k, v in batch.items()}
 
         with torch.inference_mode():
