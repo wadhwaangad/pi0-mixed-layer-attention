@@ -214,11 +214,9 @@ def run_episode(
         # postprocess undoes normalization on the action (unnormalize, detokenize etc.)
         action    = postprocess(action)
         action_np = action.cpu().numpy().flatten()
-        print(f"action: {action_np}")
         obs, _reward, done, info = env.step(action_np)
-        print(f"step={steps_taken} done={done} success={info.get('success', False)} action={action_np[:3]}")
         steps_taken += 1
-        ep_success = ep_success or bool(info.get("success", False))
+        ep_success = ep_success or bool(env._check_success())
         if done or ep_success or steps_taken >= max_steps:
             return ep_success, steps_taken
 
