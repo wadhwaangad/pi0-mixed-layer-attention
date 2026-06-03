@@ -375,7 +375,6 @@ class PI0PolicyMixedLayerAttention(PI0Policy):
         import torch
         MODEL_ID = "lerobot/pi0_libero_finetuned_v044"
         device = "cuda" 
-        print(f"from_pretrained called on cls={cls}") 
     
         # Step 1: load base in bfloat16 — avoids the float32 → bf16 copy bloat
         from lerobot.policies.pi0 import PI0Policy
