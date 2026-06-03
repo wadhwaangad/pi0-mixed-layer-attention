@@ -403,3 +403,10 @@ class PI0PolicyMixedLayerAttention(PI0Policy):
         policy = policy.to(device="cuda", dtype=torch.bfloat16)
         torch.cuda.empty_cache()
         return policy
+    def select_action(self, batch):
+        device = next(self.parameters()).device
+        batch = {
+            k: v.to(device) if isinstance(v, torch.Tensor) else v
+            for k, v in batch.items()
+        }
+        return super().select_action(batch)
