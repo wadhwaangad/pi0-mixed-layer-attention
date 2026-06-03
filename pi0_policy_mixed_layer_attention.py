@@ -288,7 +288,7 @@ class PI0PytorchMixedLayerAttention(PI0Pytorch):
     
     def forward(
             self, images, img_masks, lang_tokens, lang_masks,
-            state, actions, noise, time
+            state, actions, noise=None, time=None
         ) -> Tensor:
 
         self._kv_cache.clear()
