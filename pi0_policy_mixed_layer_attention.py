@@ -8,8 +8,8 @@ from torch import Tensor
 from lerobot.policies.pi0.modeling_pi0 import (
     PI0Pytorch,
     make_att_2d_masks,
-    layernorm_forward,
 )
+
 from lerobot.policies.pi0 import PI0Policy
 from mixed_layer_attention import MixedLayerAttention
 
@@ -18,7 +18,8 @@ from lerobot.policies.pi_gemma import _gated_residual
 
 PALIGEMMA_LAYERS = 18
 ACTION_EXPERT_LAYERS = 18
-
+def layernorm_forward(layernorm_fn, hidden_states, cond):
+    return layernorm_fn(hidden_states, cond=cond)
 
 class LoRALinear(nn.Module):
     """
