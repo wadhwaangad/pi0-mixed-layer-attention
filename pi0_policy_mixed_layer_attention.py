@@ -14,7 +14,12 @@ from lerobot.policies.pi0 import PI0Policy
 from mixed_layer_attention import MixedLayerAttention
 
 from transformers.models.gemma import modeling_gemma
-_gated_residual = modeling_gemma._gated_residual
+
+
+def _gated_residual(residual, hidden_states, gate):
+    if gate is None:
+        return residual + hidden_states
+    return residual + gate * hidden_states
 
 PALIGEMMA_LAYERS = 18
 ACTION_EXPERT_LAYERS = 18
