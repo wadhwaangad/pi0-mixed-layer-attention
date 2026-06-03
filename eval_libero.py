@@ -209,7 +209,7 @@ def run_episode(
             
         if 'observation.state' in batch:
             batch['observation.state'] = batch['observation.state'].to(torch.bfloat16)
-            action = policy.select_action(batch)
+        action = policy.select_action(batch)
 
         # postprocess undoes normalization on the action (unnormalize, detokenize etc.)
         action    = postprocess(action)
