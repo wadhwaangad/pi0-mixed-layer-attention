@@ -206,7 +206,7 @@ def run_episode(
         # postprocess undoes normalization on the action (unnormalize, detokenize etc.)
         action    = postprocess(action)
         action_np = action.cpu().numpy().flatten()
-
+        print(action_np)
         obs, _reward, done, info = env.step(action_np)
         steps_taken += 1
         ep_success = ep_success or bool(info.get("success", False))
