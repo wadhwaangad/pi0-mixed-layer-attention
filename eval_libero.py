@@ -216,7 +216,7 @@ def run_episode(
         action_np = action.cpu().numpy().flatten()
         obs, _reward, done, info = env.step(action_np)
         steps_taken += 1
-        ep_success = ep_success or bool(env._check_success())
+        ep_success = ep_success or bool(env.check_success())
         if done or ep_success or steps_taken >= max_steps:
             return ep_success, steps_taken
 
