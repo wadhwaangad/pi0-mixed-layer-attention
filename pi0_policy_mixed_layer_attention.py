@@ -292,6 +292,15 @@ class PI0PytorchMixedLayerAttention(PI0Pytorch):
     ) -> Tensor:
 
         self._kv_cache.clear()
+        device = next(self.parameters()).device
+        images = images.to(device)
+        img_masks = img_masks.to(device)
+        lang_tokens = lang_tokens.to(device)
+        lang_masks = lang_masks.to(device)
+        state = state.to(device, dtype=torch.bfloat16)
+        actions = actions.to(device, dtype=torch.bfloat16)
+        noise = noise.to(device, dtype=torch.bfloat16)
+        time = time.to(device, dtype=torch.bfloat16)
 
         time_expanded = time[:, None, None]
         x_t = time_expanded * noise + (1 - time_expanded) * actions
@@ -363,24 +372,34 @@ class PI0PolicyMixedLayerAttention(PI0Policy):
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path, **kwargs):
         import gc
+        import torch
         MODEL_ID = "lerobot/pi0_libero_finetuned_v044"
-        
-        # Step 1: load base weights
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+    
+        # Step 1: load base in bfloat16 — avoids the float32 → bf16 copy bloat
         from lerobot.policies.pi0 import PI0Policy
-        base = PI0Policy.from_pretrained(MODEL_ID)
+        base = PI0Policy.from_pretrained(MODEL_ID, torch_dtype=torch.bfloat16)
         config = base.config
-        config.device = "cpu"
-        
-        # Step 2: create MLA policy with base weights
+        config.device = device
+    
+        # Step 2: build MLA policy and copy weights while base is still on CPU
         policy = cls(config)
-        policy.load_state_dict(base.state_dict(), strict=False)
+        # strict=False because MLA and LoRA keys won't be in base state dict
+        missing, unexpected = policy.model.load_state_dict(base.state_dict(), strict=False)
         del base
         gc.collect()
-        
-        # Step 3: overlay MLA checkpoint
-        import torch
-        ckpt = torch.load(pretrained_model_name_or_path, map_location="cpu", weights_only=True)
-        missing, unexpected = policy.model.load_state_dict(ckpt, strict=False)
-        print(f"[MLA] Missing: {len(missing)} Unexpected: {len(unexpected)}")
-        
+    
+        # Step 3: overlay your MLA checkpoint (still on CPU)
+        if pretrained_model_name_or_path:
+            ckpt = torch.load(
+                pretrained_model_name_or_path,
+                map_location="cpu",
+                weights_only=True,
+            )
+            policy.model.load_state_dict(ckpt, strict=False)
+    
+        # Step 4: move everything to GPU in one shot
+        policy = policy.to(device=device, dtype=torch.bfloat16)
+        torch.cuda.empty_cache()
+    
         return policy
