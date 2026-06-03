@@ -88,10 +88,7 @@ def build_model(device: str, use_mla: bool = True):
 
     policy = policy.to(device).eval()
     policy.model.to(torch.bfloat16)
-    # Keep vision encoder in float32 as training did
-    for name, param in policy.model.named_parameters():
-        if any(k in name for k in ["vision_tower", "input_layernorm", "post_attention_layernorm", "model.norm"]):
-            param.data = param.data.to(torch.float32)
+    
 
     # Use make_pre_post_processors for all normalization — matches reference script exactly
     preprocess, postprocess = make_pre_post_processors(
