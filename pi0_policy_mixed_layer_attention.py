@@ -461,6 +461,9 @@ class PI0PolicyMixedLayerAttention(PI0Policy):
         mla_ckpt = {k.removeprefix("model."): v for k, v in mla_ckpt.items()}
     
         missing, unexpected = policy.model.load_state_dict(mla_ckpt, strict=False)
+        print("Missing:")
+        for k in missing[:20]:
+            print(k)
         print(f"[MLA] Missing: {len(missing)}, Unexpected: {len(unexpected)}")
         del mla_ckpt
         gc.collect()
