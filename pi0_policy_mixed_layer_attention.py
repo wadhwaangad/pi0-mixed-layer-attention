@@ -162,7 +162,7 @@ class PI0PytorchMixedLayerAttention(PI0Pytorch):
         gates         = []
         pre_ln_hiddens = []
 
-        use_mixed = len(paligemma_hiddens) > 0
+        use_mixed = False
         _, weights = self.mla(paligemma_hiddens, expert_layer_idx=layer_idx)
 
         paligemma_layer = paligemma.model.language_model.layers[layer_idx]
