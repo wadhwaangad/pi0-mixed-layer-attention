@@ -366,16 +366,16 @@ class PI0PolicyMixedLayerAttention(PI0Policy):
     def from_pretrained(cls, pretrained_model_name_or_path, **kwargs):
         import gc, os
         import torch
-        from safetensors.torch import load_file
+    
         BASE_MODEL_ID = "lerobot/pi0_libero_finetuned_v044"
     
         # Step 1: load base on CPU
         from lerobot.policies.pi0 import PI0Policy
         base = PI0Policy.from_pretrained(BASE_MODEL_ID)
         config = base.config
-        config.device = "cpu"  # keep on CPU during construction to avoid OOM
+        config.device = "cpu"
     
-        # Step 2: build MLA policy on CPU
+        # Step 2: build MLA policy on CPU, copy base weights
         policy = cls(config)
         base_sd = {k.removeprefix("model."): v for k, v in base.state_dict().items()}
         policy.model.load_state_dict(base_sd, strict=False)
@@ -383,20 +383,22 @@ class PI0PolicyMixedLayerAttention(PI0Policy):
         gc.collect()
         torch.cuda.empty_cache()
     
-        # Step 3: overlay MLA checkpoint
-        mla_file = os.path.join(pretrained_model_name_or_path, "model.safetensors")
-        print(f"[MLA] Loading MLA weights from: {mla_file}")
-        mla_ckpt = load_file(mla_file, device="cpu")
+        # Step 3: overlay trainable weights from model.pt
+        pt_file = os.path.join(pretrained_model_name_or_path, "model.pt")
+        print(f"[MLA] Loading MLA weights from: {pt_file}")
+        mla_ckpt = torch.load(pt_file, map_location="cpu", weights_only=True)
         mla_ckpt = {k.removeprefix("model."): v for k, v in mla_ckpt.items()}
+    
         missing, unexpected = policy.model.load_state_dict(mla_ckpt, strict=False)
         print(f"[MLA] Missing: {len(missing)}, Unexpected: {len(unexpected)}")
         del mla_ckpt
         gc.collect()
     
-        # Step 4: now move to GPU — base is already deleted so no OOM
+        # Step 4: move to GPU
         policy = policy.to(device="cuda", dtype=torch.bfloat16)
         torch.cuda.empty_cache()
         return policy
+        
     def select_action(self, batch):
         device = next(self.parameters()).device
         batch = {
