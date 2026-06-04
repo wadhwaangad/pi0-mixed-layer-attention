@@ -364,14 +364,14 @@ class PI0PolicyMixedLayerAttention(PI0Policy):
         self.model = PI0PytorchMixedLayerAttention(config)
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path, **kwargs):
-        import gc, os
+        import gc
         import torch
     
-        BASE_MODEL_ID = "lerobot/pi0_libero_finetuned_v044"
+        MLA_CHECKPOINT = "/home/angadw/pi0-mixed-layer-attention/outputs/mixed_layer_attention_continued/checkpoint_009000/model.pt"
     
         # Step 1: load base on CPU
         from lerobot.policies.pi0 import PI0Policy
-        base = PI0Policy.from_pretrained(BASE_MODEL_ID)
+        base = PI0Policy.from_pretrained(pretrained_model_name_or_path)
         config = base.config
         config.device = "cpu"
     
@@ -383,10 +383,9 @@ class PI0PolicyMixedLayerAttention(PI0Policy):
         gc.collect()
         torch.cuda.empty_cache()
     
-        # Step 3: overlay trainable weights from model.pt
-        pt_file = os.path.join(pretrained_model_name_or_path, "model.pt")
-        print(f"[MLA] Loading MLA weights from: {pt_file}")
-        mla_ckpt = torch.load(pt_file, map_location="cpu", weights_only=True)
+        # Step 3: overlay trainable weights from hardcoded checkpoint
+        print(f"[MLA] Loading MLA weights from: {MLA_CHECKPOINT}")
+        mla_ckpt = torch.load(MLA_CHECKPOINT, map_location="cpu", weights_only=True)
         mla_ckpt = {k.removeprefix("model."): v for k, v in mla_ckpt.items()}
     
         missing, unexpected = policy.model.load_state_dict(mla_ckpt, strict=False)
@@ -398,7 +397,6 @@ class PI0PolicyMixedLayerAttention(PI0Policy):
         policy = policy.to(device="cuda", dtype=torch.bfloat16)
         torch.cuda.empty_cache()
         return policy
-        
     def select_action(self, batch):
         device = next(self.parameters()).device
         batch = {
