@@ -150,9 +150,9 @@ def parse_args():
     p.add_argument(
         "--checkpoints", nargs="+",
         default=[
-            "./outputs/mixed_layer_attention/checkpoint_006000/model.pt",
-            "./outputs/mixed_layer_attention/checkpoint_008000/model.pt",
-            "./outputs/mixed_layer_attention/checkpoint_010000/model.pt",
+            "./outputs/mixed_layer_attention_continued/checkpoint_008000/model.pt",
+            "./outputs/mixed_layer_attention_continued/checkpoint_009000/model.pt",
+            "./outputs/mixed_layer_attention_continued/checkpoint_010000/model.pt",
         ],
         help="Checkpoint paths to evaluate",
     )
