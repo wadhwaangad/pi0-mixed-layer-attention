@@ -21,7 +21,7 @@ from pi0_policy_mixed_layer_attention import PI0PolicyMixedLayerAttention
 DEVICE        = "cuda"
 BATCH_SIZE    = 2
 ACCUM_STEPS   = 2
-NUM_STEPS     = 2000     
+NUM_STEPS     = 5000     
 LR            = 3e-4
 LR_MLA        = 3e-3
 WEIGHT_DECAY  = 1e-5
@@ -32,7 +32,7 @@ WARMUP_STEPS  = 0           # set > 0 if you want a fresh warmup after resume
 
 OUTPUT_DIR    = "./outputs/mixed_layer_attention_continued"
 MODEL_ID      = "lerobot/pi0_libero_finetuned_v044"      # base architecture weights
-RESUME_CKPT   = "./outputs/mixed_layer_attention_continued/checkpoint_007000/model.pt"
+RESUME_CKPT   = "./outputs/mixed_layer_attention_continued/checkpoint_008000/model.pt"
 RESUME_STEP   = 7000      # step counter offset for logging/saving
 
 # ── Config ─────────────────────────────────────────────────────────────────
