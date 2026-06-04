@@ -354,7 +354,79 @@ class PI0PytorchMixedLayerAttention(PI0Pytorch):
         v_t = self.action_out_proj(suffix_out)
 
         return F.mse_loss(u_t, v_t, reduction="none")
-
+    @torch.no_grad()
+    def sample_actions(self, images, img_masks, lang_tokens, lang_masks, state,
+                       noise=None, num_steps=None, **kwargs):
+        if num_steps is None:
+            num_steps = self.config.num_inference_steps
+    
+        bsize = state.shape[0]
+        device = state.device
+    
+        if noise is None:
+            actions_shape = (bsize, self.config.chunk_size, self.config.max_action_dim)
+            noise = self.sample_noise(actions_shape, device)
+    
+        dt = -1.0 / num_steps
+        x_t = noise
+    
+        for step in range(num_steps):
+            self._kv_cache.clear()
+            time = 1.0 + step * dt
+            time_tensor = torch.tensor(time, dtype=torch.float32, device=device).expand(bsize)
+    
+            prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
+                images, img_masks, lang_tokens, lang_masks
+            )
+            suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(
+                state, x_t, time_tensor
+            )
+    
+            dtype = (
+                self.paligemma_with_expert.paligemma.model.language_model
+                .layers[0].self_attn.q_proj.weight.dtype
+            )
+            if dtype == torch.bfloat16:
+                prefix_embs = prefix_embs.to(dtype=torch.bfloat16)
+                suffix_embs = suffix_embs.to(dtype=torch.bfloat16)
+    
+            pad_masks = torch.cat([prefix_pad_masks, suffix_pad_masks], dim=1)
+            att_masks = torch.cat([prefix_att_masks, suffix_att_masks], dim=1)
+            att_2d_masks = make_att_2d_masks(pad_masks, att_masks)
+            position_ids = torch.cumsum(pad_masks, dim=1) - 1
+            att_2d_masks_4d = self._prepare_attention_masks_4d(att_2d_masks)
+    
+            paligemma = self.paligemma_with_expert.paligemma
+            gemma_expert = self.paligemma_with_expert.gemma_expert
+            num_layers = paligemma.config.text_config.num_hidden_layers
+    
+            paligemma_hiddens = []
+            inputs_embeds = [prefix_embs, suffix_embs]
+    
+            for layer_idx in range(num_layers):
+                inputs_embeds = self._compute_layer_mla(
+                    layer_idx=layer_idx,
+                    inputs_embeds=inputs_embeds,
+                    attention_mask=att_2d_masks_4d,
+                    position_ids=position_ids,
+                    adarms_cond=[None, adarms_cond],
+                    paligemma=paligemma,
+                    gemma_expert=gemma_expert,
+                    paligemma_hiddens=paligemma_hiddens,
+                )
+    
+            paligemma_out, expert_out = inputs_embeds
+            models = [paligemma.model.language_model, gemma_expert.model]
+    
+            suffix_out = expert_out
+            suffix_out, _ = layernorm_forward(models[1].norm, suffix_out, adarms_cond)
+            suffix_out = suffix_out[:, -self.config.chunk_size:]
+            suffix_out = suffix_out.to(dtype=torch.float32)
+            v_t = self.action_out_proj(suffix_out.to(self.action_out_proj.weight.dtype))
+    
+            x_t = x_t + dt * v_t
+    
+        return x_t
 
 class PI0PolicyMixedLayerAttention(PI0Policy):
     """Drop-in replacement for PI0Policy using mixed-layer attention."""
